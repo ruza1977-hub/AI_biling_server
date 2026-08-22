@@ -32,8 +32,8 @@ class LedgerEntry(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     app_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("app_clients.id", ondelete="CASCADE"), index=True)
     wallet_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("wallets.id", ondelete="CASCADE"), index=True)
-    kind: Mapped[str] = mapped_column(String(32), nullable=False)  # topup | charge | refund | adjustment
-    amount_micros: Mapped[int] = mapped_column(BigInteger, nullable=False)  # positive adds, negative deducts
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)  # topup | charge | reserve | refund | adjustment
+    amount_micros: Mapped[int] = mapped_column(BigInteger, nullable=False)
     balance_after_micros: Mapped[int] = mapped_column(BigInteger, nullable=False)
     idempotency_key: Mapped[str] = mapped_column(String(160), nullable=False)
     note: Mapped[str | None] = mapped_column(Text)
@@ -68,3 +68,30 @@ class UsageRecord(Base):
     idempotency_key: Mapped[str] = mapped_column(String(160), nullable=False)
     metadata_json: Mapped[dict | None] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class AIRequest(Base):
+    __tablename__ = "ai_requests"
+    __table_args__ = (UniqueConstraint("app_id", "idempotency_key", name="uq_ai_request_app_idempotency"),)
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    app_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("app_clients.id", ondelete="CASCADE"), index=True)
+    wallet_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("wallets.id", ondelete="CASCADE"), index=True)
+    external_user_id: Mapped[str] = mapped_column(String(160), index=True, nullable=False)
+    provider: Mapped[str] = mapped_column(String(60), default="openai", nullable=False)
+    model: Mapped[str] = mapped_column(String(120), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(160), nullable=False)
+    status: Mapped[str] = mapped_column(String(24), default="pending", nullable=False, index=True)
+    reserved_micros: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    input_micros_per_million: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    output_micros_per_million: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    markup_bps: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    charged_micros: Mapped[int | None] = mapped_column(BigInteger)
+    input_tokens: Mapped[int | None] = mapped_column(Integer)
+    output_tokens: Mapped[int | None] = mapped_column(Integer)
+    response_id: Mapped[str | None] = mapped_column(String(160))
+    output_text: Mapped[str | None] = mapped_column(Text)
+    error_code: Mapped[str | None] = mapped_column(String(80))
+    error_detail: Mapped[str | None] = mapped_column(Text)
+    metadata_json: Mapped[dict | None] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

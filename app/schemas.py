@@ -1,4 +1,5 @@
 from decimal import Decimal
+from typing import Any
 from pydantic import BaseModel, Field
 
 
@@ -36,4 +37,14 @@ class ChargeIn(BaseModel):
     input_tokens: int = Field(ge=0)
     output_tokens: int = Field(ge=0)
     idempotency_key: str = Field(min_length=8, max_length=160)
-    metadata: dict | None = None
+    metadata: dict[str, Any] | None = None
+
+
+class AIChatIn(BaseModel):
+    external_user_id: str = Field(min_length=1, max_length=160)
+    model: str = Field(min_length=1, max_length=120)
+    input: str = Field(min_length=1, max_length=200_000)
+    instructions: str | None = Field(default=None, max_length=50_000)
+    max_output_tokens: int = Field(default=2048, ge=16, le=32768)
+    idempotency_key: str = Field(min_length=8, max_length=160)
+    metadata: dict[str, Any] | None = None
