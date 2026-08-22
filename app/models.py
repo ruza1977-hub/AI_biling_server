@@ -95,3 +95,22 @@ class AIRequest(Base):
     metadata_json: Mapped[dict | None] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class UserRegistration(Base):
+    __tablename__ = "user_registrations"
+    __table_args__ = (
+        UniqueConstraint("app_id", "email_normalized", name="uq_registration_app_email"),
+        UniqueConstraint("app_id", "device_id_hash", name="uq_registration_app_device"),
+        UniqueConstraint("app_id", "external_user_id", name="uq_registration_app_user"),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    app_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("app_clients.id", ondelete="CASCADE"), index=True)
+    email_normalized: Mapped[str] = mapped_column(String(254), index=True, nullable=False)
+    device_id_hash: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    external_user_id: Mapped[str] = mapped_column(String(80), index=True, nullable=False)
+    trial_granted: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    trial_credits: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

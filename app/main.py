@@ -2,8 +2,14 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+import base64
+import json
+import time
 from decimal import Decimal, ROUND_CEILING
 import hashlib
+import hmac
+import re
+import uuid
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from sqlalchemy import func, select
@@ -12,24 +18,32 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .config import settings
-from .db import Base, engine
-from .models import AIRequest, AppClient, LedgerEntry, ModelPrice, UsageRecord, Wallet
+from .db import Base, engine, SessionLocal
+from .models import AIRequest, AppClient, LedgerEntry, ModelPrice, UsageRecord, UserRegistration, Wallet
 from .openai_gateway import OpenAIGatewayError, create_response
-from .schemas import AIChatIn, ChargeIn, PricingIn, RegisterAppIn, RegisterAppOut, TopUpIn
-from .security import generate_api_key, get_db, hash_api_key, require_admin, require_app
+from .schemas import AIEstimateIn, AIChatIn, ChargeIn, PricingIn, PublicRegisterUserIn, RegisterAppIn, RegisterAppOut, RegisterUserIn, TopUpCreditsIn, TopUpIn
+from .security import UserAuth, create_user_token, device_hash, generate_api_key, get_db, hash_api_key, require_admin, require_app, require_user
 
 MICROS_PER_RM = 1_000_000
+MICROS_PER_CREDIT = 10_000  # 1 kredit = RM0.01 = 1 sen
+CREDITS_PER_RM = 100
 TOKENS_PER_MILLION = 1_000_000
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    # v0.2 adds only a new ai_requests table, so create_all safely upgrades v0.1 databases.
+    # v0.4 preserves all prior data and ensures the public OPR application identity exists.
     Base.metadata.create_all(bind=engine)
+    with SessionLocal() as db:
+        app_row = db.scalar(select(AppClient).where(AppClient.name == settings.public_opr_app_name))
+        if app_row is None:
+            raw_key = generate_api_key()
+            db.add(AppClient(name=settings.public_opr_app_name, api_key_hash=hash_api_key(raw_key), active=True))
+            db.commit()
     yield
 
 
-app = FastAPI(title=settings.service_name, version="0.2.0", lifespan=lifespan)
+app = FastAPI(title=settings.service_name, version="0.4.0", lifespan=lifespan)
 
 
 def micros_to_rm(value: int) -> str:
@@ -40,6 +54,15 @@ def rm_to_micros(value: Decimal) -> int:
     return int((value * MICROS_PER_RM).to_integral_value(rounding=ROUND_CEILING))
 
 
+def credits_to_micros(value: int) -> int:
+    return int(value) * MICROS_PER_CREDIT
+
+
+def micros_to_credits(value: int) -> int:
+    # Kredit ialah unit boleh guna. Baki pecahan sen warisan tidak dikira sebagai 1 kredit penuh.
+    return int(Decimal(value) / Decimal(MICROS_PER_CREDIT))
+
+
 def charge_for_tokens(input_tokens: int, output_tokens: int, *, input_rate: int, output_rate: int, markup_bps: int) -> int:
     raw_cost = (
         Decimal(input_tokens) * Decimal(input_rate)
@@ -48,7 +71,10 @@ def charge_for_tokens(input_tokens: int, output_tokens: int, *, input_rate: int,
     with_markup = raw_cost * (Decimal(10_000 + markup_bps) / Decimal(10_000))
     if input_tokens == 0 and output_tokens == 0:
         return 0
-    return max(1, int(with_markup.to_integral_value(rounding=ROUND_CEILING)))
+    raw_micros = max(1, int(with_markup.to_integral_value(rounding=ROUND_CEILING)))
+    # Pengguna membayar dalam unit kredit bulat: 1 kredit = 1 sen.
+    credits = int((Decimal(raw_micros) / Decimal(MICROS_PER_CREDIT)).to_integral_value(rounding=ROUND_CEILING))
+    return max(1, credits) * MICROS_PER_CREDIT
 
 
 def reservation_input_tokens(input_text: str, instructions: str | None) -> int:
@@ -61,6 +87,32 @@ def reservation_input_tokens(input_text: str, instructions: str | None) -> int:
 def ai_ledger_key(idempotency_key: str, stage: str) -> str:
     digest = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()[:48]
     return f"ai-{digest}-{stage}"
+
+
+def normalize_email(value: str) -> str:
+    email = value.strip().lower()
+    if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
+        raise HTTPException(status_code=422, detail={"code": "INVALID_EMAIL", "message": "Alamat e-mel tidak sah."})
+    return email
+
+
+def hash_device_id(value: str) -> str:
+    return device_hash(value)
+
+
+def registration_response(reg: UserRegistration, db: Session, *, duplicate: bool, trial_granted_now: bool) -> dict:
+    wallet = db.scalar(select(Wallet).where(Wallet.app_id == reg.app_id, Wallet.external_user_id == reg.external_user_id))
+    balance = wallet.balance_micros if wallet else 0
+    return {
+        "ok": True,
+        "duplicate": duplicate,
+        "trial_granted": trial_granted_now,
+        "trial_credits": reg.trial_credits,
+        "external_user_id": reg.external_user_id,
+        "email": reg.email_normalized,
+        "balance_credits": micros_to_credits(balance),
+        "balance_rm": micros_to_rm(balance),
+    }
 
 
 def get_or_create_wallet(db: Session, app_id, external_user_id: str) -> Wallet:
@@ -103,7 +155,9 @@ def replay_ai_request(req: AIRequest, db: Session) -> dict:
             "input_tokens": req.input_tokens or 0,
             "output_tokens": req.output_tokens or 0,
             "charged_rm": micros_to_rm(req.charged_micros or 0),
+            "charged_credits": micros_to_credits(req.charged_micros or 0),
             "balance_rm": micros_to_rm(balance),
+            "balance_credits": micros_to_credits(balance),
         }
     if req.status == "pending":
         raise HTTPException(status_code=409, detail={"code": "REQUEST_IN_PROGRESS", "request_id": str(req.id)})
@@ -120,7 +174,7 @@ def health():
     return {
         "ok": True,
         "service": settings.service_name,
-        "version": "0.2.0",
+        "version": "0.4.0",
         "openai_configured": bool(settings.openai_api_key),
     }
 
@@ -186,6 +240,8 @@ def list_pricing(db: Session = Depends(get_db)):
 
 @app.post("/v1/admin/topup", dependencies=[Depends(require_admin)])
 def topup(payload: TopUpIn, db: Session = Depends(get_db)):
+    if payload.amount_rm < Decimal(settings.min_topup_rm):
+        raise HTTPException(status_code=422, detail={"code": "MINIMUM_TOPUP", "message": f"Top up minimum RM{settings.min_topup_rm}.", "minimum_rm": settings.min_topup_rm, "minimum_credits": settings.min_topup_rm * CREDITS_PER_RM})
     client = db.scalar(select(AppClient).where(AppClient.name == payload.app_name, AppClient.active.is_(True)))
     if not client:
         raise HTTPException(status_code=404, detail="App not found")
@@ -195,7 +251,7 @@ def topup(payload: TopUpIn, db: Session = Depends(get_db)):
         LedgerEntry.idempotency_key == payload.idempotency_key,
     ))
     if existing:
-        return {"ok": True, "duplicate": True, "balance_rm": micros_to_rm(existing.balance_after_micros)}
+        return {"ok": True, "duplicate": True, "balance_rm": micros_to_rm(existing.balance_after_micros), "balance_credits": micros_to_credits(existing.balance_after_micros)}
 
     try:
         wallet = get_or_create_wallet(db, client.id, payload.external_user_id)
@@ -207,14 +263,66 @@ def topup(payload: TopUpIn, db: Session = Depends(get_db)):
             note=payload.note,
         ))
         db.commit()
-        return {"ok": True, "duplicate": False, "balance_rm": micros_to_rm(wallet.balance_micros)}
+        return {"ok": True, "duplicate": False, "balance_rm": micros_to_rm(wallet.balance_micros), "balance_credits": micros_to_credits(wallet.balance_micros)}
     except IntegrityError:
         db.rollback()
         existing = db.scalar(select(LedgerEntry).where(
             LedgerEntry.app_id == client.id, LedgerEntry.idempotency_key == payload.idempotency_key))
         if existing:
-            return {"ok": True, "duplicate": True, "balance_rm": micros_to_rm(existing.balance_after_micros)}
+            return {"ok": True, "duplicate": True, "balance_rm": micros_to_rm(existing.balance_after_micros), "balance_credits": micros_to_credits(existing.balance_after_micros)}
         raise
+
+
+@app.post("/v1/admin/topup-credits", dependencies=[Depends(require_admin)])
+def topup_credits(payload: TopUpCreditsIn, db: Session = Depends(get_db)):
+    minimum_credits = settings.min_topup_rm * CREDITS_PER_RM
+    if payload.credits < minimum_credits:
+        raise HTTPException(status_code=422, detail={"code": "MINIMUM_TOPUP", "message": f"Top up minimum {minimum_credits} kredit (RM{settings.min_topup_rm}).", "minimum_rm": settings.min_topup_rm, "minimum_credits": minimum_credits})
+    client = db.scalar(select(AppClient).where(AppClient.name == payload.app_name, AppClient.active.is_(True)))
+    if not client:
+        raise HTTPException(status_code=404, detail="App not found")
+    existing = db.scalar(select(LedgerEntry).where(
+        LedgerEntry.app_id == client.id, LedgerEntry.idempotency_key == payload.idempotency_key))
+    if existing:
+        return {"ok": True, "duplicate": True, "balance_credits": micros_to_credits(existing.balance_after_micros)}
+    wallet = get_or_create_wallet(db, client.id, payload.external_user_id)
+    amount = credits_to_micros(payload.credits)
+    wallet.balance_micros += amount
+    db.add(LedgerEntry(
+        app_id=client.id, wallet_id=wallet.id, kind="topup", amount_micros=amount,
+        balance_after_micros=wallet.balance_micros, idempotency_key=payload.idempotency_key,
+        note=payload.note or f"Topup {payload.credits} kredit",
+    ))
+    db.commit()
+    return {
+        "ok": True, "duplicate": False, "added_credits": payload.credits,
+        "balance_credits": micros_to_credits(wallet.balance_micros),
+        "balance_rm": micros_to_rm(wallet.balance_micros),
+    }
+
+
+@app.get("/v1/admin/users", dependencies=[Depends(require_admin)])
+def admin_users(
+    limit: int = Query(default=200, ge=1, le=1000),
+    app_name: str | None = None,
+    db: Session = Depends(get_db),
+):
+    stmt = (select(UserRegistration, AppClient.name, Wallet.balance_micros)
+            .join(AppClient, AppClient.id == UserRegistration.app_id)
+            .join(Wallet, (Wallet.app_id == UserRegistration.app_id) & (Wallet.external_user_id == UserRegistration.external_user_id))
+            .order_by(UserRegistration.created_at.desc()).limit(limit))
+    if app_name:
+        stmt = stmt.where(AppClient.name == app_name)
+    rows = db.execute(stmt).all()
+    return [{
+        "id": str(reg.id), "app_name": name, "email": reg.email_normalized,
+        "external_user_id": reg.external_user_id,
+        "device_id_hash_prefix": reg.device_id_hash[:12],
+        "trial_credits": reg.trial_credits, "trial_granted": reg.trial_granted,
+        "balance_credits": micros_to_credits(balance),
+        "balance_rm": micros_to_rm(balance),
+        "created_at": reg.created_at, "last_seen_at": reg.last_seen_at,
+    } for reg, name, balance in rows]
 
 
 @app.get("/v1/admin/dashboard", dependencies=[Depends(require_admin)])
@@ -225,11 +333,15 @@ def admin_dashboard(db: Session = Depends(get_db)):
     total_charged = db.scalar(select(func.coalesce(func.sum(UsageRecord.charged_micros), 0))) or 0
     ai_requests = db.scalar(select(func.count()).select_from(AIRequest)) or 0
     completed = db.scalar(select(func.count()).select_from(AIRequest).where(AIRequest.status == "completed")) or 0
+    registrations = db.scalar(select(func.count()).select_from(UserRegistration)) or 0
     return {
         "apps": apps,
         "wallets": wallets,
         "total_balance_rm": micros_to_rm(balance_micros),
+        "total_balance_credits": micros_to_credits(balance_micros),
         "total_ai_charged_rm": micros_to_rm(total_charged),
+        "total_ai_charged_credits": micros_to_credits(total_charged),
+        "registrations": registrations,
         "ai_requests": ai_requests,
         "ai_completed": completed,
     }
@@ -251,7 +363,9 @@ def admin_ledger(
     return [{
         "id": str(entry.id), "app_name": name, "external_user_id": user_id,
         "kind": entry.kind, "amount_rm": micros_to_rm(entry.amount_micros),
+        "amount_credits": str(Decimal(entry.amount_micros) / Decimal(MICROS_PER_CREDIT)),
         "balance_after_rm": micros_to_rm(entry.balance_after_micros),
+        "balance_after_credits": micros_to_credits(entry.balance_after_micros),
         "note": entry.note, "created_at": entry.created_at,
     } for entry, name, user_id in rows]
 
@@ -272,8 +386,303 @@ def admin_usage(
         "id": str(u.id), "app_name": name, "external_user_id": u.external_user_id,
         "provider": u.provider, "model": u.model,
         "input_tokens": u.input_tokens, "output_tokens": u.output_tokens,
-        "charged_rm": micros_to_rm(u.charged_micros), "created_at": u.created_at,
+        "charged_rm": micros_to_rm(u.charged_micros), "charged_credits": micros_to_credits(u.charged_micros), "created_at": u.created_at,
     } for u, name in rows]
+
+
+
+
+def _estimate_secret() -> bytes:
+    return (settings.user_token_secret or settings.master_admin_key).encode("utf-8")
+
+
+def _b64u(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _unb64u(value: str) -> bytes:
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+
+def _estimate_fingerprint(payload: AIEstimateIn | AIChatIn) -> str:
+    canonical = json.dumps({
+        "external_user_id": payload.external_user_id,
+        "model": payload.model,
+        "input": payload.input,
+        "instructions": payload.instructions or "",
+        "max_output_tokens": payload.max_output_tokens,
+    }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _make_estimate_token(*, app_id: str, user_id: str, fingerprint: str, estimate_credits: int) -> str:
+    body = {
+        "v": 1,
+        "app_id": app_id,
+        "user_id": user_id,
+        "fp": fingerprint,
+        "credits": estimate_credits,
+        "exp": int(time.time()) + settings.estimate_ttl_seconds,
+    }
+    encoded = _b64u(json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+    sig = hmac.new(_estimate_secret(), encoded.encode("ascii"), hashlib.sha256).digest()
+    return encoded + "." + _b64u(sig)
+
+
+def _read_estimate_token(token: str) -> dict:
+    try:
+        encoded, sig_text = token.split(".", 1)
+        expected = hmac.new(_estimate_secret(), encoded.encode("ascii"), hashlib.sha256).digest()
+        supplied = _unb64u(sig_text)
+        if not hmac.compare_digest(expected, supplied):
+            raise ValueError("signature")
+        body = json.loads(_unb64u(encoded).decode("utf-8"))
+        if int(body.get("exp", 0)) < int(time.time()):
+            raise HTTPException(status_code=409, detail={"code": "ESTIMATE_EXPIRED", "message": "Anggaran kredit telah tamat tempoh. Sila anggar semula."})
+        return body
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=409, detail={"code": "INVALID_ESTIMATE", "message": "Anggaran kredit tidak sah. Sila anggar semula."})
+
+
+# ----------------------------- User Registration -----------------------------
+
+@app.post("/v1/auth/register")
+def register_user(payload: RegisterUserIn, client: AppClient = Depends(require_app), db: Session = Depends(get_db)):
+    email = normalize_email(payload.email)
+    device_hash = hash_device_id(payload.device_id)
+    existing_email = db.scalar(select(UserRegistration).where(
+        UserRegistration.app_id == client.id, UserRegistration.email_normalized == email))
+    existing_device = db.scalar(select(UserRegistration).where(
+        UserRegistration.app_id == client.id, UserRegistration.device_id_hash == device_hash))
+
+    if existing_email or existing_device:
+        if existing_email and existing_device and existing_email.id == existing_device.id:
+            existing_email.last_seen_at = datetime.now(timezone.utc)
+            db.commit()
+            return registration_response(existing_email, db, duplicate=True, trial_granted_now=False)
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "REGISTRATION_ALREADY_USED",
+                "message": "E-mel atau peranti ini telah digunakan untuk pendaftaran percubaan aplikasi ini.",
+            },
+        )
+
+    reg = UserRegistration(
+        app_id=client.id,
+        email_normalized=email,
+        device_id_hash=device_hash,
+        external_user_id="usr_" + uuid.uuid4().hex,
+        trial_granted=True,
+        trial_credits=settings.trial_credits,
+        last_seen_at=datetime.now(timezone.utc),
+    )
+    try:
+        db.add(reg)
+        db.flush()
+        wallet = get_or_create_wallet(db, client.id, reg.external_user_id)
+        bonus = credits_to_micros(settings.trial_credits)
+        wallet.balance_micros += bonus
+        db.add(LedgerEntry(
+            app_id=client.id, wallet_id=wallet.id, kind="trial_bonus",
+            amount_micros=bonus, balance_after_micros=wallet.balance_micros,
+            idempotency_key=f"trial-{reg.id}",
+            note=f"Bonus pendaftaran percubaan {settings.trial_credits} kredit",
+        ))
+        db.commit()
+        db.refresh(reg)
+        return registration_response(reg, db, duplicate=False, trial_granted_now=True)
+    except IntegrityError:
+        db.rollback()
+        existing_email = db.scalar(select(UserRegistration).where(
+            UserRegistration.app_id == client.id, UserRegistration.email_normalized == email))
+        existing_device = db.scalar(select(UserRegistration).where(
+            UserRegistration.app_id == client.id, UserRegistration.device_id_hash == device_hash))
+        if existing_email and existing_device and existing_email.id == existing_device.id:
+            return registration_response(existing_email, db, duplicate=True, trial_granted_now=False)
+        raise HTTPException(status_code=409, detail={
+            "code": "REGISTRATION_ALREADY_USED",
+            "message": "E-mel atau peranti ini telah digunakan untuk pendaftaran percubaan aplikasi ini.",
+        })
+
+
+
+
+@app.post("/v1/public/register")
+def public_register_user(payload: PublicRegisterUserIn, db: Session = Depends(get_db)):
+    client = db.scalar(select(AppClient).where(AppClient.name == payload.app_name, AppClient.active.is_(True)))
+    if not client:
+        raise HTTPException(status_code=404, detail={"code": "APP_NOT_FOUND", "message": "Aplikasi tidak didaftarkan pada server."})
+    email = normalize_email(payload.email)
+    device_hash_value = hash_device_id(payload.device_id)
+    existing_email = db.scalar(select(UserRegistration).where(
+        UserRegistration.app_id == client.id, UserRegistration.email_normalized == email))
+    existing_device = db.scalar(select(UserRegistration).where(
+        UserRegistration.app_id == client.id, UserRegistration.device_id_hash == device_hash_value))
+
+    if existing_email or existing_device:
+        if existing_email and existing_device and existing_email.id == existing_device.id:
+            existing_email.last_seen_at = datetime.now(timezone.utc)
+            db.commit()
+            result = registration_response(existing_email, db, duplicate=True, trial_granted_now=False)
+            result["access_token"] = create_user_token(existing_email)
+            return result
+        raise HTTPException(status_code=409, detail={
+            "code": "REGISTRATION_ALREADY_USED",
+            "message": "E-mel atau peranti ini telah digunakan untuk pendaftaran percubaan aplikasi ini.",
+        })
+
+    reg = UserRegistration(
+        app_id=client.id,
+        email_normalized=email,
+        device_id_hash=device_hash_value,
+        external_user_id="usr_" + uuid.uuid4().hex,
+        trial_granted=True,
+        trial_credits=settings.trial_credits,
+        last_seen_at=datetime.now(timezone.utc),
+    )
+    try:
+        db.add(reg)
+        db.flush()
+        wallet_row = get_or_create_wallet(db, client.id, reg.external_user_id)
+        bonus = credits_to_micros(settings.trial_credits)
+        wallet_row.balance_micros += bonus
+        db.add(LedgerEntry(
+            app_id=client.id, wallet_id=wallet_row.id, kind="trial_bonus", amount_micros=bonus,
+            balance_after_micros=wallet_row.balance_micros,
+            idempotency_key=f"trial-{reg.id}", note=f"Bonus pendaftaran {settings.trial_credits} kredit",
+        ))
+        db.commit()
+        db.refresh(reg)
+        result = registration_response(reg, db, duplicate=False, trial_granted_now=True)
+        result["access_token"] = create_user_token(reg)
+        return result
+    except IntegrityError:
+        db.rollback()
+        existing_email = db.scalar(select(UserRegistration).where(
+            UserRegistration.app_id == client.id, UserRegistration.email_normalized == email))
+        existing_device = db.scalar(select(UserRegistration).where(
+            UserRegistration.app_id == client.id, UserRegistration.device_id_hash == device_hash_value))
+        if existing_email and existing_device and existing_email.id == existing_device.id:
+            result = registration_response(existing_email, db, duplicate=True, trial_granted_now=False)
+            result["access_token"] = create_user_token(existing_email)
+            return result
+        raise HTTPException(status_code=409, detail={
+            "code": "REGISTRATION_ALREADY_USED",
+            "message": "E-mel atau peranti ini telah digunakan untuk pendaftaran percubaan aplikasi ini.",
+        })
+
+
+@app.get("/v1/user/models")
+def user_models(auth: UserAuth = Depends(require_user), db: Session = Depends(get_db)):
+    return ai_models(client=auth.client, db=db)
+
+
+@app.get("/v1/user/account/summary")
+def user_account_summary(auth: UserAuth = Depends(require_user), db: Session = Depends(get_db)):
+    reg = auth.registration
+    wallet_row = db.scalar(select(Wallet).where(Wallet.app_id == reg.app_id, Wallet.external_user_id == reg.external_user_id))
+    balance = wallet_row.balance_micros if wallet_row else 0
+    total_used = db.scalar(select(func.coalesce(func.sum(UsageRecord.charged_micros), 0)).where(
+        UsageRecord.app_id == reg.app_id, UsageRecord.external_user_id == reg.external_user_id)) or 0
+    requests = db.scalar(select(func.count()).select_from(UsageRecord).where(
+        UsageRecord.app_id == reg.app_id, UsageRecord.external_user_id == reg.external_user_id)) or 0
+    return {
+        "email": reg.email_normalized,
+        "external_user_id": reg.external_user_id,
+        "balance_credits": micros_to_credits(balance),
+        "used_credits": micros_to_credits(total_used),
+        "trial_credits": reg.trial_credits,
+        "usage_count": requests,
+        "credit_value_sen": 1,
+    }
+
+
+@app.get("/v1/user/usage/recent")
+def user_recent_usage(limit: int = Query(default=20, ge=1, le=100), auth: UserAuth = Depends(require_user), db: Session = Depends(get_db)):
+    reg = auth.registration
+    rows = db.scalars(select(UsageRecord).where(
+        UsageRecord.app_id == reg.app_id,
+        UsageRecord.external_user_id == reg.external_user_id,
+    ).order_by(UsageRecord.created_at.desc()).limit(limit)).all()
+    return [{
+        "id": str(x.id), "provider": x.provider, "model": x.model,
+        "input_tokens": x.input_tokens, "output_tokens": x.output_tokens,
+        "charged_credits": micros_to_credits(x.charged_micros), "created_at": x.created_at,
+    } for x in rows]
+
+
+@app.get("/v1/user/topup/info")
+def user_topup_info(auth: UserAuth = Depends(require_user)):
+    del auth
+    return {
+        "mode": "manual",
+        "minimum_rm": settings.min_topup_rm,
+        "minimum_credits": settings.min_topup_rm * CREDITS_PER_RM,
+        "credit_value_sen": 1,
+        "future_provider": "ToyyibPay",
+        "online_topup_enabled": False,
+        "message": f"Top up kini dibuat secara manual. Minimum RM{settings.min_topup_rm} = {settings.min_topup_rm * CREDITS_PER_RM} kredit.",
+    }
+
+
+@app.post("/v1/user/ai/estimate")
+def user_ai_estimate(payload: AIEstimateIn, auth: UserAuth = Depends(require_user), db: Session = Depends(get_db)):
+    reg = auth.registration
+    if payload.external_user_id != reg.external_user_id:
+        raise HTTPException(status_code=403, detail={"code": "USER_MISMATCH", "message": "ID pengguna tidak sepadan."})
+    price = get_active_price(db, "openai", payload.model)
+    estimated_input = reservation_input_tokens(payload.input, payload.instructions)
+    reserve_micros = charge_for_tokens(
+        estimated_input, payload.max_output_tokens,
+        input_rate=price.input_micros_per_million,
+        output_rate=price.output_micros_per_million,
+        markup_bps=price.markup_bps,
+    )
+    estimate_credits = micros_to_credits(reserve_micros)
+    wallet_row = db.scalar(select(Wallet).where(Wallet.app_id == reg.app_id, Wallet.external_user_id == reg.external_user_id))
+    balance_micros = wallet_row.balance_micros if wallet_row else 0
+    balance_credits = micros_to_credits(balance_micros)
+    token = _make_estimate_token(
+        app_id=str(reg.app_id), user_id=reg.external_user_id,
+        fingerprint=_estimate_fingerprint(payload), estimate_credits=estimate_credits,
+    )
+    return {
+        "ok": True,
+        "estimate_credits": estimate_credits,
+        "balance_credits": balance_credits,
+        "balance_after_estimate_credits": max(0, balance_credits - estimate_credits),
+        "enough_credit": balance_micros >= reserve_micros,
+        "estimate_token": token,
+        "expires_in_seconds": settings.estimate_ttl_seconds,
+        "note": "Ini anggaran maksimum konservatif. Caj akhir menggunakan token sebenar dan tidak melebihi anggaran yang diluluskan tanpa anggaran baharu.",
+    }
+
+
+@app.post("/v1/user/ai/chat")
+def user_ai_chat(payload: AIChatIn, auth: UserAuth = Depends(require_user), db: Session = Depends(get_db)):
+    reg = auth.registration
+    if payload.external_user_id != reg.external_user_id:
+        raise HTTPException(status_code=403, detail={"code": "USER_MISMATCH", "message": "ID pengguna tidak sepadan."})
+    if not payload.estimate_token:
+        raise HTTPException(status_code=409, detail={"code": "ESTIMATE_REQUIRED", "message": "Anggaran kredit mesti dipaparkan dan diluluskan sebelum transaksi AI."})
+    quote = _read_estimate_token(payload.estimate_token)
+    if quote.get("app_id") != str(reg.app_id) or quote.get("user_id") != reg.external_user_id or quote.get("fp") != _estimate_fingerprint(payload):
+        raise HTTPException(status_code=409, detail={"code": "ESTIMATE_MISMATCH", "message": "Maklumat berubah selepas anggaran. Sila anggar semula."})
+
+    price = get_active_price(db, "openai", payload.model)
+    current_reserve = charge_for_tokens(
+        reservation_input_tokens(payload.input, payload.instructions), payload.max_output_tokens,
+        input_rate=price.input_micros_per_million,
+        output_rate=price.output_micros_per_million,
+        markup_bps=price.markup_bps,
+    )
+    current_credits = micros_to_credits(current_reserve)
+    if current_credits > int(quote.get("credits", 0)):
+        raise HTTPException(status_code=409, detail={"code": "ESTIMATE_CHANGED", "message": "Anggaran harga telah berubah. Sila semak anggaran baharu sebelum meneruskan."})
+    return ai_chat(payload, client=auth.client, db=db)
 
 
 # ----------------------------- App Billing API -----------------------------
@@ -285,6 +694,7 @@ def wallet(external_user_id: str, client: AppClient = Depends(require_app), db: 
         "app": client.name,
         "external_user_id": external_user_id,
         "balance_rm": micros_to_rm(row.balance_micros if row else 0),
+        "balance_credits": micros_to_credits(row.balance_micros if row else 0),
     }
 
 
@@ -300,7 +710,9 @@ def charge(payload: ChargeIn, client: AppClient = Depends(require_app), db: Sess
         return {
             "ok": True, "duplicate": True,
             "charged_rm": micros_to_rm(existing.charged_micros),
+            "charged_credits": micros_to_credits(existing.charged_micros),
             "balance_rm": micros_to_rm(wallet_row.balance_micros),
+            "balance_credits": micros_to_credits(wallet_row.balance_micros),
         }
 
     price = get_active_price(db, payload.provider, payload.model)
@@ -345,7 +757,9 @@ def charge(payload: ChargeIn, client: AppClient = Depends(require_app), db: Sess
         return {
             "ok": True, "duplicate": False,
             "charged_rm": micros_to_rm(charge_micros),
+            "charged_credits": micros_to_credits(charge_micros),
             "balance_rm": micros_to_rm(wallet_row.balance_micros),
+            "balance_credits": micros_to_credits(wallet_row.balance_micros),
         }
     except IntegrityError:
         db.rollback()
@@ -356,7 +770,9 @@ def charge(payload: ChargeIn, client: AppClient = Depends(require_app), db: Sess
             return {
                 "ok": True, "duplicate": True,
                 "charged_rm": micros_to_rm(existing.charged_micros),
+                "charged_credits": micros_to_credits(existing.charged_micros),
                 "balance_rm": micros_to_rm(wallet_row.balance_micros),
+                "balance_credits": micros_to_credits(wallet_row.balance_micros),
             }
         raise
 
@@ -376,7 +792,7 @@ def recent_usage(
     return [{
         "id": str(x.id), "provider": x.provider, "model": x.model,
         "input_tokens": x.input_tokens, "output_tokens": x.output_tokens,
-        "charged_rm": micros_to_rm(x.charged_micros), "created_at": x.created_at,
+        "charged_rm": micros_to_rm(x.charged_micros), "charged_credits": micros_to_credits(x.charged_micros), "created_at": x.created_at,
     } for x in rows]
 
 
@@ -425,7 +841,9 @@ def ai_chat(payload: AIChatIn, client: AppClient = Depends(require_app), db: Ses
                 detail={
                     "code": "INSUFFICIENT_CREDIT",
                     "required_reserve_rm": micros_to_rm(reserve_micros),
+                    "required_reserve_credits": micros_to_credits(reserve_micros),
                     "balance_rm": micros_to_rm(current_balance),
+                    "balance_credits": micros_to_credits(current_balance),
                     "note": "Reserve is conservative; final charge uses actual OpenAI token usage.",
                 },
             )
@@ -553,5 +971,7 @@ def ai_chat(payload: AIChatIn, client: AppClient = Depends(require_app), db: Ses
         "input_tokens": result.input_tokens,
         "output_tokens": result.output_tokens,
         "charged_rm": micros_to_rm(actual_charge),
+        "charged_credits": micros_to_credits(actual_charge),
         "balance_rm": micros_to_rm(wallet_row.balance_micros),
+        "balance_credits": micros_to_credits(wallet_row.balance_micros),
     }
