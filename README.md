@@ -1,56 +1,72 @@
-# AI Billing Server v0.1
+# AI Billing Server v0.2
 
-Backend billing AI multi-app untuk Railway + PostgreSQL.
+FastAPI + PostgreSQL backend untuk Railway. v0.2 mengekalkan semua endpoint billing v0.1 dan menambah **OpenAI AI Gateway**, reservation kredit, settlement token sebenar, serta endpoint dashboard admin.
 
-## Konsep
-- Satu billing server boleh digunakan oleh banyak aplikasi.
-- Setiap aplikasi mempunyai `X-API-Key` tersendiri.
-- Wallet dipisahkan mengikut `app + external_user_id`.
-- Nilai wang disimpan sebagai integer micro-RM: `RM1 = 1,000,000 micros`.
-- Semua topup/charge direkod dalam ledger.
-- `idempotency_key` mengelakkan caj/topup berganda apabila request diulang.
-- Harga AI dikonfigurasi pada server; client tidak menentukan harga sendiri.
+## Ciri v0.2
 
-## Deploy Railway
-1. Buat Project Railway.
-2. Tambah PostgreSQL.
-3. Tambah service daripada repo GitHub yang mengandungi projek ini.
-4. Di Variables service API, tetapkan:
-   - `DATABASE_URL=${{Postgres.DATABASE_URL}}`
-   - `MASTER_ADMIN_KEY=<rahsia-panjang-rawak>`
-   - `SERVICE_NAME=AI Billing Server`
-5. Generate Domain pada Settings > Networking.
-6. Uji `GET /health`.
+- `POST /v1/ai/chat` memanggil OpenAI Responses API dari server.
+- `OPENAI_API_KEY` hanya berada pada Railway/backend, bukan dalam aplikasi klien.
+- Semak harga model dan wallet sebelum panggilan OpenAI.
+- Reserve kredit secara konservatif sebelum kos provider berlaku.
+- Selepas respons: guna `usage.input_tokens` + `usage.output_tokens` sebenar untuk caj akhir.
+- Pulangkan baki reservation yang tidak digunakan.
+- Jika panggilan OpenAI gagal, reservation dipulangkan sepenuhnya.
+- Idempotency: request sama tidak sepatutnya memanggil OpenAI dua kali selepas ia selesai.
+- Respons OpenAI dibuat dengan `store=false`.
+- v0.1 endpoints kekal untuk keserasian modul Admin macOS sedia ada.
+- Admin API baharu: dashboard, list apps, list pricing, ledger, usage.
 
-> Jika nama service PostgreSQL anda bukan `Postgres`, tukar namespace reference variable itu mengikut nama service sebenar.
+## Railway Variables
 
-## Aliran ujian
-
-### 1) Daftar aplikasi
-```bash
-curl -X POST "$BASE_URL/v1/admin/apps" \
-  -H "X-Admin-Key: $MASTER_ADMIN_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"name":"GBK-Mobile"}'
+```text
+DATABASE_URL=${{Postgres.DATABASE_URL}}
+MASTER_ADMIN_KEY=<rahsia-admin-anda>
+OPENAI_API_KEY=sk-proj-...
+SERVICE_NAME=AI Billing Server
 ```
-Simpan `api_key` yang dipulangkan. Server hanya menyimpan hash.
 
-### 2) Tetapkan harga model
-Contoh sahaja — masukkan kadar sebenar yang anda mahu bil kepada pengguna.
+Pilihan:
+
+```text
+OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_TIMEOUT_SECONDS=120
+```
+
+Jangan commit `.env` atau API key sebenar ke GitHub.
+
+## Upgrade daripada v0.1
+
+v0.2 menambah jadual baru `ai_requests`. Jadual v0.1 tidak dipadam atau dinamakan semula. Pada startup, SQLAlchemy `create_all()` akan mencipta jadual baru itu.
+
+## Aliran penggunaan
+
+### 1. Uji server
+
+```bash
+curl "$BASE_URL/health"
+```
+
+### 2. Tetapkan harga model
+
+Harga billing server adalah **RM per 1 juta token**. Tentukan kadar RM sendiri berdasarkan kos provider, kadar USD/RM dan margin anda.
+
 ```bash
 curl -X POST "$BASE_URL/v1/admin/pricing" \
   -H "X-Admin-Key: $MASTER_ADMIN_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "provider":"openai",
-    "model":"MODEL_NAME",
-    "input_rm_per_million":"1.00",
-    "output_rm_per_million":"4.00",
+    "model":"gpt-5.6-luna",
+    "input_rm_per_million":"2.50",
+    "output_rm_per_million":"15.00",
     "markup_percent":"20"
   }'
 ```
 
-### 3) Tambah kredit RM10
+> Nilai di atas hanya contoh konfigurasi billing anda, bukan janji harga provider semasa.
+
+### 3. Top-up pengguna
+
 ```bash
 curl -X POST "$BASE_URL/v1/admin/topup" \
   -H "X-Admin-Key: $MASTER_ADMIN_KEY" \
@@ -64,27 +80,61 @@ curl -X POST "$BASE_URL/v1/admin/topup" \
   }'
 ```
 
-### 4) Semak wallet
-```bash
-curl "$BASE_URL/v1/wallet?external_user_id=guru-001" \
-  -H "X-API-Key: $APP_API_KEY"
-```
+### 4. Panggil AI Gateway
 
-### 5) Caj penggunaan AI
 ```bash
-curl -X POST "$BASE_URL/v1/usage/charge" \
+curl -X POST "$BASE_URL/v1/ai/chat" \
   -H "X-API-Key: $APP_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "external_user_id":"guru-001",
-    "provider":"openai",
-    "model":"MODEL_NAME",
-    "input_tokens":1200,
-    "output_tokens":500,
-    "idempotency_key":"req-gbk-20260822-000001",
-    "metadata":{"feature":"jana_rph"}
+    "model":"gpt-5.6-luna",
+    "input":"Terangkan fotosintesis secara ringkas dalam Bahasa Melayu.",
+    "instructions":"Jawab sebagai pembantu guru sekolah.",
+    "max_output_tokens":700,
+    "idempotency_key":"gbk-ai-20260822-000001",
+    "metadata":{"feature":"nota_ai"}
   }'
 ```
 
-## Nota keselamatan penting
-`X-API-Key` aplikasi ini direka untuk **server-to-server**. Jangan hardcode key rahsia kekal di APK Android kerana ia boleh diekstrak. Untuk aplikasi mudah alih terus ke billing server, versi seterusnya perlu tambah login/JWT atau signed session token per pengguna/peranti.
+Contoh respons:
+
+```json
+{
+  "ok": true,
+  "duplicate": false,
+  "model": "gpt-5.6-luna",
+  "output_text": "...",
+  "input_tokens": 32,
+  "output_tokens": 180,
+  "charged_rm": "0.003210",
+  "balance_rm": "9.996790"
+}
+```
+
+## Endpoint utama
+
+### Admin (`X-Admin-Key`)
+
+- `POST /v1/admin/apps`
+- `GET /v1/admin/apps`
+- `POST /v1/admin/pricing`
+- `GET /v1/admin/pricing`
+- `POST /v1/admin/topup`
+- `GET /v1/admin/dashboard`
+- `GET /v1/admin/ledger`
+- `GET /v1/admin/usage`
+
+### App (`X-API-Key`)
+
+- `GET /v1/wallet?external_user_id=...`
+- `GET /v1/usage/recent?external_user_id=...`
+- `POST /v1/usage/charge` (legacy/manual billing)
+- `GET /v1/ai/models`
+- `POST /v1/ai/chat`
+
+## Keselamatan
+
+`X-API-Key` app masih merupakan rahsia server-to-server. Untuk APK Android/iOS yang bercakap terus dengan server, langkah seterusnya ialah akaun pengguna + access token/JWT atau token sesi bertandatangan. Jangan hardcode `MASTER_ADMIN_KEY`, `OPENAI_API_KEY`, atau app API key kekal dalam APK.
+
+v0.2 menyimpan `output_text` untuk replay idempotent. Jika data aplikasi anda sangat sensitif, v0.3 patut menambah polisi retention/enkripsi output atau mod `store_output=false` selepas identiti pengguna/JWT tersedia.
