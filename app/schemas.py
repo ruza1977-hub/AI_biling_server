@@ -1,0 +1,39 @@
+from decimal import Decimal
+from pydantic import BaseModel, Field
+
+
+class RegisterAppIn(BaseModel):
+    name: str = Field(min_length=2, max_length=120)
+
+
+class RegisterAppOut(BaseModel):
+    app_id: str
+    name: str
+    api_key: str
+
+
+class TopUpIn(BaseModel):
+    app_name: str
+    external_user_id: str = Field(min_length=1, max_length=160)
+    amount_rm: Decimal = Field(gt=0)
+    idempotency_key: str = Field(min_length=8, max_length=160)
+    note: str | None = None
+
+
+class PricingIn(BaseModel):
+    provider: str = Field(min_length=1, max_length=60)
+    model: str = Field(min_length=1, max_length=120)
+    input_rm_per_million: Decimal = Field(ge=0)
+    output_rm_per_million: Decimal = Field(ge=0)
+    markup_percent: Decimal = Field(default=Decimal("0"), ge=0, le=1000)
+    active: bool = True
+
+
+class ChargeIn(BaseModel):
+    external_user_id: str = Field(min_length=1, max_length=160)
+    provider: str = Field(min_length=1, max_length=60)
+    model: str = Field(min_length=1, max_length=120)
+    input_tokens: int = Field(ge=0)
+    output_tokens: int = Field(ge=0)
+    idempotency_key: str = Field(min_length=8, max_length=160)
+    metadata: dict | None = None
