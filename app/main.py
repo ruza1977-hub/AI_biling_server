@@ -23,7 +23,7 @@ from .config import settings
 from .db import Base, engine, SessionLocal
 from .models import AIRequest, AppClient, DeviceAccount, DeviceAppLink, LedgerEntry, ModelPrice, UsageRecord, UserDevice, UserRegistration, Wallet
 from .openai_gateway import OpenAIGatewayError, create_response
-from .schemas import AdminSetPasswordIn, AIEstimateIn, AIChatIn, ChangePasswordIn, ChargeIn, DeviceBootstrapIn, DeviceTopUpCreditsIn, ForgotPasswordIn, PricingIn, PublicLoginUserIn, PublicRegisterUserIn, RegisterAppIn, RegisterAppOut, RegisterUserIn, TopUpCreditsIn, TopUpIn
+from .schemas import AdminSetPasswordIn, AIEstimateIn, AIChatIn, ChangePasswordIn, ChargeIn, DeviceBootstrapIn, DeviceEmailIn, DeviceTopUpByEmailIn, DeviceTopUpCreditsIn, ForgotPasswordIn, PricingIn, PublicLoginUserIn, PublicRegisterUserIn, RegisterAppIn, RegisterAppOut, RegisterUserIn, TopUpCreditsIn, TopUpIn
 from .security import DeviceAuth, UserAuth, create_device_token, create_user_token, device_hash, generate_api_key, get_db, hash_api_key, hash_password, password_needs_rehash, require_admin, require_app, require_device_user, require_user, verify_password
 from .email_service import EmailDeliveryError, email_configured, email_provider, send_temporary_password
 
@@ -47,6 +47,8 @@ async def lifespan(_: FastAPI):
         conn.execute(text("ALTER TABLE user_registrations ADD COLUMN IF NOT EXISTS password_reset_expires_at TIMESTAMPTZ"))
         conn.execute(text("ALTER TABLE user_registrations ADD COLUMN IF NOT EXISTS failed_login_count INTEGER NOT NULL DEFAULT 0"))
         conn.execute(text("ALTER TABLE user_registrations ADD COLUMN IF NOT EXISTS locked_until TIMESTAMPTZ"))
+        conn.execute(text("ALTER TABLE device_accounts ADD COLUMN IF NOT EXISTS email_normalized VARCHAR(254)"))
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_device_accounts_email_normalized ON device_accounts (email_normalized) WHERE email_normalized IS NOT NULL"))
     # user_devices depends only on existing columns, so create again after the migration.
     Base.metadata.create_all(bind=engine)
     with SessionLocal() as db:
@@ -63,6 +65,21 @@ async def lifespan(_: FastAPI):
                     device_id_hash=reg.device_id_hash,
                     first_seen_at=reg.created_at, last_seen_at=reg.last_seen_at,
                 ))
+        db.commit()
+        # v1.0: backfill one unique legacy e-mail onto the Device Wallet.
+        for account in db.scalars(select(DeviceAccount).where(DeviceAccount.email_normalized.is_(None))).all():
+            legacy_emails = sorted({
+                r.email_normalized for r in db.scalars(select(UserRegistration).where(
+                    UserRegistration.device_id_hash == account.device_id_hash
+                )).all() if r.email_normalized
+            })
+            if len(legacy_emails) == 1:
+                already = db.scalar(select(DeviceAccount).where(
+                    DeviceAccount.email_normalized == legacy_emails[0],
+                    DeviceAccount.id != account.id,
+                ))
+                if already is None:
+                    account.email_normalized = legacy_emails[0]
         db.commit()
         # Public device apps do not expose API keys to Android. They are identified by
         # app_name during device bootstrap; the server still keeps an AppClient row so
@@ -81,7 +98,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title=settings.service_name, version="0.9.0", lifespan=lifespan)
+app = FastAPI(title=settings.service_name, version="1.0.0", lifespan=lifespan)
 
 
 def micros_to_rm(value: int) -> str:
@@ -253,7 +270,7 @@ def health():
     return {
         "ok": True,
         "service": settings.service_name,
-        "version": "0.9.0",
+        "version": "1.0.0",
         "openai_configured": bool(settings.openai_api_key),
         "email_configured": email_configured(),
         "email_provider": email_provider(),
@@ -445,6 +462,8 @@ def admin_dashboard(db: Session = Depends(get_db)):
     ai_requests = db.scalar(select(func.count()).select_from(AIRequest)) or 0
     completed = db.scalar(select(func.count()).select_from(AIRequest).where(AIRequest.status == "completed")) or 0
     registrations = db.scalar(select(func.count()).select_from(UserRegistration)) or 0
+    device_wallets = db.scalar(select(func.count()).select_from(DeviceAccount)) or 0
+    device_wallets_with_email = db.scalar(select(func.count()).select_from(DeviceAccount).where(DeviceAccount.email_normalized.is_not(None))) or 0
     return {
         "apps": apps,
         "wallets": wallets,
@@ -453,9 +472,16 @@ def admin_dashboard(db: Session = Depends(get_db)):
         "total_ai_charged_rm": micros_to_rm(total_charged),
         "total_ai_charged_credits": micros_to_credits(total_charged),
         "registrations": registrations,
+        "device_wallets": device_wallets,
+        "device_wallets_with_email": device_wallets_with_email,
         "ai_requests": ai_requests,
         "ai_completed": completed,
     }
+
+
+def _device_email_for_external_user(db: Session, external_user_id: str) -> str | None:
+    account = db.scalar(select(DeviceAccount).where(DeviceAccount.external_user_id == external_user_id))
+    return account.email_normalized if account else None
 
 
 @app.get("/v1/admin/ledger", dependencies=[Depends(require_admin)])
@@ -473,6 +499,7 @@ def admin_ledger(
     rows = db.execute(stmt).all()
     return [{
         "id": str(entry.id), "app_name": name, "external_user_id": user_id,
+        "email": _device_email_for_external_user(db, user_id),
         "kind": entry.kind, "amount_rm": micros_to_rm(entry.amount_micros),
         "amount_credits": str(Decimal(entry.amount_micros) / Decimal(MICROS_PER_CREDIT)),
         "balance_after_rm": micros_to_rm(entry.balance_after_micros),
@@ -495,6 +522,7 @@ def admin_usage(
     rows = db.execute(stmt).all()
     return [{
         "id": str(u.id), "app_name": name, "external_user_id": u.external_user_id,
+        "email": _device_email_for_external_user(db, u.external_user_id),
         "provider": u.provider, "model": u.model,
         "input_tokens": u.input_tokens, "output_tokens": u.output_tokens,
         "charged_rm": micros_to_rm(u.charged_micros), "charged_credits": micros_to_credits(u.charged_micros), "created_at": u.created_at,
@@ -704,6 +732,44 @@ def _create_or_migrate_device_account(db: Session, device_hash_value: str) -> tu
     return account, wallet_row, True, False, 0
 
 
+def _bind_device_email(db: Session, account: DeviceAccount, raw_email: str) -> str:
+    email = normalize_email(raw_email)
+    other = db.scalar(select(DeviceAccount).where(
+        DeviceAccount.email_normalized == email,
+        DeviceAccount.id != account.id,
+        DeviceAccount.active.is_(True),
+    ))
+    if other is not None:
+        raise HTTPException(status_code=409, detail={
+            "code": "EMAIL_ALREADY_BOUND",
+            "message": "E-mel ini sudah dirujuk kepada Device Wallet lain.",
+        })
+    if account.email_normalized and account.email_normalized != email:
+        raise HTTPException(status_code=409, detail={
+            "code": "EMAIL_MISMATCH",
+            "message": "Device Wallet ini sudah mempunyai e-mel rujukan lain.",
+        })
+    account.email_normalized = email
+    return email
+
+
+def _infer_legacy_device_email(db: Session, account: DeviceAccount) -> str | None:
+    emails = sorted({
+        r.email_normalized for r in db.scalars(select(UserRegistration).where(
+            UserRegistration.device_id_hash == account.device_id_hash
+        )).all() if r.email_normalized
+    })
+    if len(emails) == 1:
+        other = db.scalar(select(DeviceAccount).where(
+            DeviceAccount.email_normalized == emails[0],
+            DeviceAccount.id != account.id,
+        ))
+        if other is None:
+            account.email_normalized = emails[0]
+            return emails[0]
+    return None
+
+
 @app.post("/v1/device/bootstrap")
 def device_bootstrap(payload: DeviceBootstrapIn, db: Session = Depends(get_db)):
     """Passwordless bootstrap. Device ID is hashed server-side and never stored raw.
@@ -716,6 +782,10 @@ def device_bootstrap(payload: DeviceBootstrapIn, db: Session = Depends(get_db)):
     try:
         account, wallet_row, created, migrated, migrated_credits = _create_or_migrate_device_account(db, device_hash_value)
         _link_device_app_v09(db, account, client)
+        if account.email_normalized is None:
+            _infer_legacy_device_email(db, account)
+        if payload.email:
+            _bind_device_email(db, account, payload.email)
         db.commit()
         db.refresh(account)
         db.refresh(wallet_row)
@@ -726,6 +796,10 @@ def device_bootstrap(payload: DeviceBootstrapIn, db: Session = Depends(get_db)):
             raise
         wallet_row = get_or_create_wallet(db, _device_wallet_hub(db).id, account.external_user_id)
         _link_device_app_v09(db, account, client)
+        if account.email_normalized is None:
+            _infer_legacy_device_email(db, account)
+        if payload.email:
+            _bind_device_email(db, account, payload.email)
         db.commit()
         created = False
         migrated = account.migrated_from_legacy
@@ -741,11 +815,21 @@ def device_bootstrap(payload: DeviceBootstrapIn, db: Session = Depends(get_db)):
         "trial_credits": account.trial_credits,
         "external_user_id": account.external_user_id,
         "device_account_id": account.external_user_id,
+        "email": account.email_normalized,
+        "email_required": account.email_normalized is None,
         "balance_credits": micros_to_credits(wallet_row.balance_micros),
         "balance_rm": micros_to_rm(wallet_row.balance_micros),
         "app_name": client.name,
         "access_token": create_device_token(account, client, current_device_hash=device_hash_value),
     }
+
+
+@app.post("/v1/device/profile/email")
+def device_profile_email(payload: DeviceEmailIn, auth: DeviceAuth = Depends(require_device_user), db: Session = Depends(get_db)):
+    email = _bind_device_email(db, auth.account, payload.email)
+    auth.account.last_seen_at = datetime.now(timezone.utc)
+    db.commit()
+    return {"ok": True, "email": email, "device_account_id": auth.account.external_user_id}
 
 
 def _device_wallet_for_auth(db: Session, auth: DeviceAuth, *, lock: bool = False) -> Wallet:
@@ -777,6 +861,8 @@ def device_account_summary(auth: DeviceAuth = Depends(require_device_user), db: 
     return {
         "device_account_id": auth.account.external_user_id,
         "external_user_id": auth.account.external_user_id,
+        "email": auth.account.email_normalized,
+        "email_required": auth.account.email_normalized is None,
         "balance_credits": micros_to_credits(wallet_row.balance_micros),
         "used_credits": micros_to_credits(total_used),
         "trial_credits": auth.account.trial_credits,
@@ -823,6 +909,8 @@ def device_topup_info(auth: DeviceAuth = Depends(require_device_user)):
 @app.post("/v1/device/ai/estimate")
 def device_ai_estimate(payload: AIEstimateIn, auth: DeviceAuth = Depends(require_device_user), db: Session = Depends(get_db)):
     account = auth.account
+    if not account.email_normalized:
+        raise HTTPException(status_code=428, detail={"code": "EMAIL_REQUIRED", "message": "Masukkan e-mel rujukan sekali sebelum menggunakan AI."})
     if payload.external_user_id != account.external_user_id:
         raise HTTPException(status_code=403, detail={"code": "USER_MISMATCH", "message": "ID dompet peranti tidak sepadan."})
     price = get_default_ai_price(db)
@@ -858,6 +946,8 @@ def device_ai_estimate(payload: AIEstimateIn, auth: DeviceAuth = Depends(require
 @app.post("/v1/device/ai/chat")
 def device_ai_chat(payload: AIChatIn, auth: DeviceAuth = Depends(require_device_user), db: Session = Depends(get_db)):
     account = auth.account
+    if not account.email_normalized:
+        raise HTTPException(status_code=428, detail={"code": "EMAIL_REQUIRED", "message": "Masukkan e-mel rujukan sekali sebelum menggunakan AI."})
     if payload.external_user_id != account.external_user_id:
         raise HTTPException(status_code=403, detail={"code": "USER_MISMATCH", "message": "ID dompet peranti tidak sepadan."})
     if not payload.estimate_token:
@@ -884,9 +974,16 @@ def device_ai_chat(payload: AIChatIn, auth: DeviceAuth = Depends(require_device_
 
 
 @app.get("/v1/admin/device-wallets", dependencies=[Depends(require_admin)])
-def admin_device_wallets(limit: int = Query(default=200, ge=1, le=1000), db: Session = Depends(get_db)):
+def admin_device_wallets(
+    limit: int = Query(default=200, ge=1, le=1000),
+    email: str | None = None,
+    db: Session = Depends(get_db),
+):
     hub = _device_wallet_hub(db)
-    accounts = db.scalars(select(DeviceAccount).order_by(DeviceAccount.created_at.desc()).limit(limit)).all()
+    stmt = select(DeviceAccount).order_by(DeviceAccount.created_at.desc()).limit(limit)
+    if email:
+        stmt = stmt.where(DeviceAccount.email_normalized == normalize_email(email))
+    accounts = db.scalars(stmt).all()
     result = []
     for account in accounts:
         wallet_row = db.scalar(select(Wallet).where(
@@ -901,6 +998,7 @@ def admin_device_wallets(limit: int = Query(default=200, ge=1, le=1000), db: Ses
         )) or 0
         result.append({
             "device_account_id": account.external_user_id,
+            "email": account.email_normalized,
             "device_hash_prefix": account.device_id_hash[:12],
             "balance_credits": micros_to_credits(wallet_row.balance_micros if wallet_row else 0),
             "used_credits": micros_to_credits(used),
@@ -955,6 +1053,55 @@ def admin_device_wallet_topup(payload: DeviceTopUpCreditsIn, db: Session = Depen
         "ok": True,
         "duplicate": False,
         "added_credits": payload.credits,
+        "balance_credits": micros_to_credits(wallet_row.balance_micros),
+    }
+
+
+@app.post("/v1/admin/device-wallets/topup-by-email", dependencies=[Depends(require_admin)])
+def admin_device_wallet_topup_by_email(payload: DeviceTopUpByEmailIn, db: Session = Depends(get_db)):
+    email = normalize_email(payload.email)
+    account = db.scalar(select(DeviceAccount).where(
+        DeviceAccount.email_normalized == email,
+        DeviceAccount.active.is_(True),
+    ))
+    if account is None:
+        raise HTTPException(status_code=404, detail={
+            "code": "EMAIL_WALLET_NOT_FOUND",
+            "message": "Tiada Device Wallet aktif ditemui untuk e-mel ini.",
+        })
+    if payload.amount_rm < Decimal(settings.min_topup_rm):
+        raise HTTPException(status_code=422, detail={
+            "code": "MINIMUM_TOPUP",
+            "message": f"Top up minimum RM{settings.min_topup_rm}.",
+        })
+    credits = int((payload.amount_rm * Decimal(CREDITS_PER_RM)).to_integral_value())
+    hub = _device_wallet_hub(db)
+    existing = db.scalar(select(LedgerEntry).where(
+        LedgerEntry.app_id == hub.id,
+        LedgerEntry.idempotency_key == payload.idempotency_key,
+    ))
+    if existing:
+        return {
+            "ok": True, "duplicate": True, "email": email,
+            "device_account_id": account.external_user_id,
+            "added_credits": 0,
+            "balance_credits": micros_to_credits(existing.balance_after_micros),
+        }
+    wallet_row = get_or_create_wallet(db, hub.id, account.external_user_id)
+    amount = credits_to_micros(credits)
+    wallet_row.balance_micros += amount
+    db.add(LedgerEntry(
+        app_id=hub.id, wallet_id=wallet_row.id, kind="topup", amount_micros=amount,
+        balance_after_micros=wallet_row.balance_micros,
+        idempotency_key=payload.idempotency_key,
+        note=payload.note or f"Top up manual {email}",
+    ))
+    db.commit()
+    return {
+        "ok": True, "duplicate": False, "email": email,
+        "device_account_id": account.external_user_id,
+        "added_credits": credits,
+        "amount_rm": credits_to_rm_display(credits),
         "balance_credits": micros_to_credits(wallet_row.balance_micros),
     }
 
