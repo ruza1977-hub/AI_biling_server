@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 
 from .config import settings
 from .db import SessionLocal
-from .models import AppClient, UserDevice, UserRegistration
+from .models import AppClient, DeviceAccount, DeviceAppLink, UserDevice, UserRegistration
 
 _password_hasher = PasswordHasher(time_cost=3, memory_cost=65536, parallelism=2, hash_len=32, salt_len=16)
 
@@ -174,3 +174,86 @@ def require_user(
     if not client:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail={"code": "APP_INACTIVE", "message": "Aplikasi tidak aktif."})
     return UserAuth(client=client, registration=reg)
+
+
+
+def create_device_token(account: DeviceAccount, client: AppClient, *, current_device_hash: str) -> str:
+    now = int(time.time())
+    payload = {
+        "v": 3,
+        "type": "device",
+        "app_id": str(client.id),
+        "user_id": account.external_user_id,
+        "device_hash": current_device_hash,
+        "iat": now,
+        "exp": now + int(settings.user_token_days) * 86400,
+    }
+    encoded = _b64url_encode(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+    sig = hmac.new(_token_secret(), encoded.encode("ascii"), hashlib.sha256).digest()
+    return encoded + "." + _b64url_encode(sig)
+
+
+@dataclass
+class DeviceAuth:
+    client: AppClient
+    account: DeviceAccount
+
+
+def require_device_user(
+    authorization: str | None = Header(default=None, alias="Authorization"),
+    x_device_id: str | None = Header(default=None, alias="X-Device-ID"),
+    db: Session = Depends(get_db),
+) -> DeviceAuth:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail={"code": "DEVICE_TOKEN_REQUIRED", "message": "Sesi peranti diperlukan."})
+    if not x_device_id:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail={"code": "DEVICE_ID_REQUIRED", "message": "ID peranti diperlukan."})
+
+    token = authorization[7:].strip()
+    try:
+        encoded, sig_text = token.split(".", 1)
+        expected = hmac.new(_token_secret(), encoded.encode("ascii"), hashlib.sha256).digest()
+        supplied = _b64url_decode(sig_text)
+        if not hmac.compare_digest(expected, supplied):
+            raise ValueError("signature")
+        payload = json.loads(_b64url_decode(encoded).decode("utf-8"))
+        if int(payload.get("v", 0)) < 3 or payload.get("type") != "device":
+            raise ValueError("type")
+        if int(payload.get("exp", 0)) < int(time.time()):
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail={"code": "TOKEN_EXPIRED", "message": "Sesi tamat. Aplikasi akan menyambung semula secara automatik."})
+        app_id = payload["app_id"]
+        user_id = payload["user_id"]
+        token_device_hash = payload["device_hash"]
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail={"code": "INVALID_DEVICE_TOKEN", "message": "Sesi peranti tidak sah."})
+
+    current_device_hash = device_hash(x_device_id)
+    if not hmac.compare_digest(token_device_hash, current_device_hash):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail={"code": "DEVICE_MISMATCH", "message": "Sesi ini bukan untuk peranti ini."})
+
+    account = db.scalar(select(DeviceAccount).where(
+        DeviceAccount.external_user_id == user_id,
+        DeviceAccount.device_id_hash == current_device_hash,
+        DeviceAccount.active.is_(True),
+    ))
+    if not account:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail={"code": "DEVICE_ACCOUNT_NOT_FOUND", "message": "Dompet peranti tidak ditemui."})
+
+    client = db.scalar(select(AppClient).where(AppClient.id == app_id, AppClient.active.is_(True)))
+    if not client:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail={"code": "APP_INACTIVE", "message": "Aplikasi tidak aktif."})
+
+    link = db.scalar(select(DeviceAppLink).where(
+        DeviceAppLink.device_account_id == account.id,
+        DeviceAppLink.app_id == client.id,
+    ))
+    if not link:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail={"code": "APP_NOT_LINKED", "message": "Aplikasi belum dipautkan kepada dompet peranti."})
+
+    now = datetime.now(timezone.utc)
+    account.last_seen_at = now
+    link.last_seen_at = now
+    db.commit()
+    return DeviceAuth(client=client, account=account)

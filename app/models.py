@@ -135,3 +135,26 @@ class UserDevice(Base):
     device_id_hash: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
     first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class DeviceAccount(Base):
+    __tablename__ = "device_accounts"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    device_id_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    external_user_id: Mapped[str] = mapped_column(String(80), unique=True, index=True, nullable=False)
+    trial_granted: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    trial_credits: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    migrated_from_legacy: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class DeviceAppLink(Base):
+    __tablename__ = "device_app_links"
+    __table_args__ = (UniqueConstraint("device_account_id", "app_id", name="uq_device_app_link"),)
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    device_account_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("device_accounts.id", ondelete="CASCADE"), index=True)
+    app_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("app_clients.id", ondelete="CASCADE"), index=True)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

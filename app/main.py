@@ -21,11 +21,11 @@ from sqlalchemy.orm import Session
 
 from .config import settings
 from .db import Base, engine, SessionLocal
-from .models import AIRequest, AppClient, LedgerEntry, ModelPrice, UsageRecord, UserDevice, UserRegistration, Wallet
+from .models import AIRequest, AppClient, DeviceAccount, DeviceAppLink, LedgerEntry, ModelPrice, UsageRecord, UserDevice, UserRegistration, Wallet
 from .openai_gateway import OpenAIGatewayError, create_response
-from .schemas import AdminSetPasswordIn, AIEstimateIn, AIChatIn, ChangePasswordIn, ChargeIn, ForgotPasswordIn, PricingIn, PublicLoginUserIn, PublicRegisterUserIn, RegisterAppIn, RegisterAppOut, RegisterUserIn, TopUpCreditsIn, TopUpIn
-from .security import UserAuth, create_user_token, device_hash, generate_api_key, get_db, hash_api_key, hash_password, password_needs_rehash, require_admin, require_app, require_user, verify_password
-from .email_service import EmailDeliveryError, email_configured, send_temporary_password
+from .schemas import AdminSetPasswordIn, AIEstimateIn, AIChatIn, ChangePasswordIn, ChargeIn, DeviceBootstrapIn, DeviceTopUpCreditsIn, ForgotPasswordIn, PricingIn, PublicLoginUserIn, PublicRegisterUserIn, RegisterAppIn, RegisterAppOut, RegisterUserIn, TopUpCreditsIn, TopUpIn
+from .security import DeviceAuth, UserAuth, create_device_token, create_user_token, device_hash, generate_api_key, get_db, hash_api_key, hash_password, password_needs_rehash, require_admin, require_app, require_device_user, require_user, verify_password
+from .email_service import EmailDeliveryError, email_configured, email_provider, send_temporary_password
 
 MICROS_PER_RM = 1_000_000
 MICROS_PER_CREDIT = 10_000  # 1 kredit = RM0.01 = 1 sen
@@ -64,15 +64,24 @@ async def lifespan(_: FastAPI):
                     first_seen_at=reg.created_at, last_seen_at=reg.last_seen_at,
                 ))
         db.commit()
-        app_row = db.scalar(select(AppClient).where(AppClient.name == settings.public_opr_app_name))
-        if app_row is None:
-            raw_key = generate_api_key()
-            db.add(AppClient(name=settings.public_opr_app_name, api_key_hash=hash_api_key(raw_key), active=True))
-            db.commit()
+        # Public device apps do not expose API keys to Android. They are identified by
+        # app_name during device bootstrap; the server still keeps an AppClient row so
+        # usage can be attributed to the consuming app.
+        public_names = [x.strip() for x in settings.public_device_apps.split(",") if x.strip()]
+        if settings.public_opr_app_name not in public_names:
+            public_names.append(settings.public_opr_app_name)
+        if settings.device_wallet_hub_app_name not in public_names:
+            public_names.append(settings.device_wallet_hub_app_name)
+        for app_name in public_names:
+            app_row = db.scalar(select(AppClient).where(AppClient.name == app_name))
+            if app_row is None:
+                raw_key = generate_api_key()
+                db.add(AppClient(name=app_name, api_key_hash=hash_api_key(raw_key), active=True))
+        db.commit()
     yield
 
 
-app = FastAPI(title=settings.service_name, version="0.7.0", lifespan=lifespan)
+app = FastAPI(title=settings.service_name, version="0.9.0", lifespan=lifespan)
 
 
 def micros_to_rm(value: int) -> str:
@@ -244,9 +253,12 @@ def health():
     return {
         "ok": True,
         "service": settings.service_name,
-        "version": "0.7.0",
+        "version": "0.9.0",
         "openai_configured": bool(settings.openai_api_key),
         "email_configured": email_configured(),
+        "email_provider": email_provider(),
+        "auth_mode": "device_wallet",
+        "shared_wallet": True,
         "default_ai_model": settings.default_ai_model,
         "consumer_price_multiplier": settings.consumer_price_multiplier,
     }
@@ -543,6 +555,408 @@ def _read_estimate_token(token: str) -> dict:
         raise
     except Exception:
         raise HTTPException(status_code=409, detail={"code": "INVALID_ESTIMATE", "message": "Anggaran kredit tidak sah. Sila anggar semula."})
+
+
+
+# ----------------------------- Device Wallet v0.9 -----------------------------
+
+def _device_wallet_hub(db: Session) -> AppClient:
+    hub = db.scalar(select(AppClient).where(AppClient.name == settings.device_wallet_hub_app_name))
+    if hub is None:
+        raw_key = generate_api_key()
+        hub = AppClient(name=settings.device_wallet_hub_app_name, api_key_hash=hash_api_key(raw_key), active=True)
+        db.add(hub)
+        db.flush()
+    return hub
+
+
+def _device_app_client(db: Session, app_name: str) -> AppClient:
+    allowed = {x.strip() for x in settings.public_device_apps.split(",") if x.strip()}
+    if app_name not in allowed:
+        raise HTTPException(status_code=404, detail={
+            "code": "APP_NOT_PUBLIC_DEVICE_APP",
+            "message": "Aplikasi ini belum dibenarkan menggunakan Device Wallet.",
+        })
+    client = db.scalar(select(AppClient).where(AppClient.name == app_name, AppClient.active.is_(True)))
+    if client is None:
+        raw_key = generate_api_key()
+        client = AppClient(name=app_name, api_key_hash=hash_api_key(raw_key), active=True)
+        db.add(client)
+        db.flush()
+    return client
+
+
+def _link_device_app_v09(db: Session, account: DeviceAccount, client: AppClient) -> None:
+    now = datetime.now(timezone.utc)
+    link = db.scalar(select(DeviceAppLink).where(
+        DeviceAppLink.device_account_id == account.id,
+        DeviceAppLink.app_id == client.id,
+    ))
+    if link is None:
+        db.add(DeviceAppLink(
+            device_account_id=account.id,
+            app_id=client.id,
+            first_seen_at=now,
+            last_seen_at=now,
+        ))
+    else:
+        link.last_seen_at = now
+    account.last_seen_at = now
+
+
+def _legacy_registrations_for_device(db: Session, device_hash_value: str) -> list[UserRegistration]:
+    # Only the ORIGINAL registration device may inherit the old wallet. Devices that
+    # were merely linked later by password login are treated as new devices in v0.9,
+    # matching the new rule: a different device receives a different wallet.
+    return db.scalars(select(UserRegistration).where(
+        UserRegistration.device_id_hash == device_hash_value,
+        UserRegistration.active.is_(True),
+    )).all()
+
+
+def _create_or_migrate_device_account(db: Session, device_hash_value: str) -> tuple[DeviceAccount, Wallet, bool, bool, int]:
+    account = db.scalar(select(DeviceAccount).where(DeviceAccount.device_id_hash == device_hash_value))
+    hub = _device_wallet_hub(db)
+    if account is not None:
+        wallet_row = get_or_create_wallet(db, hub.id, account.external_user_id)
+        return account, wallet_row, False, False, 0
+
+    legacy_regs = _legacy_registrations_for_device(db, device_hash_value)
+    account = DeviceAccount(
+        device_id_hash=device_hash_value,
+        external_user_id="dev_" + uuid.uuid4().hex,
+        trial_granted=bool(legacy_regs),
+        trial_credits=max([x.trial_credits for x in legacy_regs] or [0]),
+        migrated_from_legacy=bool(legacy_regs),
+        active=True,
+        last_seen_at=datetime.now(timezone.utc),
+    )
+    db.add(account)
+    db.flush()
+    wallet_row = get_or_create_wallet(db, hub.id, account.external_user_id)
+
+    if legacy_regs:
+        migrated_micros = 0
+        old_wallet_ids = set()
+        for reg in legacy_regs:
+            old_wallet = db.scalar(select(Wallet).where(
+                Wallet.app_id == reg.app_id,
+                Wallet.external_user_id == reg.external_user_id,
+            ).with_for_update())
+            if old_wallet is not None:
+                old_wallet_ids.add(old_wallet.id)
+                if old_wallet.balance_micros:
+                    amount = old_wallet.balance_micros
+                    migrated_micros += amount
+                    old_wallet.balance_micros = 0
+                    db.add(LedgerEntry(
+                        app_id=reg.app_id,
+                        wallet_id=old_wallet.id,
+                        kind="migration_out",
+                        amount_micros=-amount,
+                        balance_after_micros=0,
+                        idempotency_key=f"device-migrate-out-{account.id}-{old_wallet.id}",
+                        note="Migrasi baki ke Device Wallet v0.9",
+                    ))
+            # Preserve old usage history under the new device account id.
+            usage_rows = db.scalars(select(UsageRecord).where(
+                UsageRecord.app_id == reg.app_id,
+                UsageRecord.external_user_id == reg.external_user_id,
+            )).all()
+            for row in usage_rows:
+                row.external_user_id = account.external_user_id
+                row.wallet_id = wallet_row.id
+            req_rows = db.scalars(select(AIRequest).where(
+                AIRequest.app_id == reg.app_id,
+                AIRequest.external_user_id == reg.external_user_id,
+            )).all()
+            for row in req_rows:
+                row.external_user_id = account.external_user_id
+                row.wallet_id = wallet_row.id
+
+        wallet_row.balance_micros += migrated_micros
+        if migrated_micros:
+            db.add(LedgerEntry(
+                app_id=hub.id,
+                wallet_id=wallet_row.id,
+                kind="migration_in",
+                amount_micros=migrated_micros,
+                balance_after_micros=wallet_row.balance_micros,
+                idempotency_key=f"device-migrate-in-{account.id}",
+                note="Baki dompet lama dipulihkan ke Device Wallet v0.9",
+            ))
+        return account, wallet_row, True, True, micros_to_credits(migrated_micros)
+
+    # Brand-new physical device: grant the trial once for the device, not once per app.
+    bonus = credits_to_micros(settings.trial_credits)
+    account.trial_granted = True
+    account.trial_credits = settings.trial_credits
+    wallet_row.balance_micros += bonus
+    db.add(LedgerEntry(
+        app_id=hub.id,
+        wallet_id=wallet_row.id,
+        kind="trial_bonus",
+        amount_micros=bonus,
+        balance_after_micros=wallet_row.balance_micros,
+        idempotency_key=f"device-trial-{account.id}",
+        note=f"Bonus peranti baharu {settings.trial_credits} kredit",
+    ))
+    return account, wallet_row, True, False, 0
+
+
+@app.post("/v1/device/bootstrap")
+def device_bootstrap(payload: DeviceBootstrapIn, db: Session = Depends(get_db)):
+    """Passwordless bootstrap. Device ID is hashed server-side and never stored raw.
+
+    Existing v0.3-v0.8 OPR registrations on the same device are migrated automatically,
+    including their current wallet balance. A brand-new device receives 50 credits once.
+    """
+    client = _device_app_client(db, payload.app_name)
+    device_hash_value = hash_device_id(payload.device_id)
+    try:
+        account, wallet_row, created, migrated, migrated_credits = _create_or_migrate_device_account(db, device_hash_value)
+        _link_device_app_v09(db, account, client)
+        db.commit()
+        db.refresh(account)
+        db.refresh(wallet_row)
+    except IntegrityError:
+        db.rollback()
+        account = db.scalar(select(DeviceAccount).where(DeviceAccount.device_id_hash == device_hash_value))
+        if account is None:
+            raise
+        wallet_row = get_or_create_wallet(db, _device_wallet_hub(db).id, account.external_user_id)
+        _link_device_app_v09(db, account, client)
+        db.commit()
+        created = False
+        migrated = account.migrated_from_legacy
+        migrated_credits = 0
+
+    return {
+        "ok": True,
+        "auto_login": True,
+        "new_device": created and not migrated,
+        "migrated_legacy_wallet": migrated,
+        "migrated_credits": migrated_credits,
+        "trial_granted": bool(created and not migrated),
+        "trial_credits": account.trial_credits,
+        "external_user_id": account.external_user_id,
+        "device_account_id": account.external_user_id,
+        "balance_credits": micros_to_credits(wallet_row.balance_micros),
+        "balance_rm": micros_to_rm(wallet_row.balance_micros),
+        "app_name": client.name,
+        "access_token": create_device_token(account, client, current_device_hash=device_hash_value),
+    }
+
+
+def _device_wallet_for_auth(db: Session, auth: DeviceAuth, *, lock: bool = False) -> Wallet:
+    hub = _device_wallet_hub(db)
+    stmt = select(Wallet).where(
+        Wallet.app_id == hub.id,
+        Wallet.external_user_id == auth.account.external_user_id,
+    )
+    if lock:
+        stmt = stmt.with_for_update()
+    wallet_row = db.scalar(stmt)
+    if wallet_row is None:
+        wallet_row = get_or_create_wallet(db, hub.id, auth.account.external_user_id)
+    return wallet_row
+
+
+@app.get("/v1/device/account/summary")
+def device_account_summary(auth: DeviceAuth = Depends(require_device_user), db: Session = Depends(get_db)):
+    wallet_row = _device_wallet_for_auth(db, auth)
+    total_used = db.scalar(select(func.coalesce(func.sum(UsageRecord.charged_micros), 0)).where(
+        UsageRecord.external_user_id == auth.account.external_user_id,
+    )) or 0
+    requests = db.scalar(select(func.count()).select_from(UsageRecord).where(
+        UsageRecord.external_user_id == auth.account.external_user_id,
+    )) or 0
+    links = db.execute(select(AppClient.name).join(DeviceAppLink, DeviceAppLink.app_id == AppClient.id).where(
+        DeviceAppLink.device_account_id == auth.account.id,
+    ).order_by(AppClient.name)).scalars().all()
+    return {
+        "device_account_id": auth.account.external_user_id,
+        "external_user_id": auth.account.external_user_id,
+        "balance_credits": micros_to_credits(wallet_row.balance_micros),
+        "used_credits": micros_to_credits(total_used),
+        "trial_credits": auth.account.trial_credits,
+        "usage_count": requests,
+        "linked_apps": list(links),
+        "credit_value_sen": 1,
+        "wallet_scope": "device",
+    }
+
+
+@app.get("/v1/device/usage/recent")
+def device_recent_usage(limit: int = Query(default=30, ge=1, le=100), auth: DeviceAuth = Depends(require_device_user), db: Session = Depends(get_db)):
+    rows = db.execute(select(UsageRecord, AppClient.name).join(
+        AppClient, UsageRecord.app_id == AppClient.id
+    ).where(
+        UsageRecord.external_user_id == auth.account.external_user_id,
+    ).order_by(UsageRecord.created_at.desc()).limit(limit)).all()
+    return [{
+        "id": str(row.id),
+        "app_name": app_name,
+        "provider": row.provider,
+        "model": row.model,
+        "input_tokens": row.input_tokens,
+        "output_tokens": row.output_tokens,
+        "charged_credits": micros_to_credits(row.charged_micros),
+        "created_at": row.created_at,
+    } for row, app_name in rows]
+
+
+@app.get("/v1/device/topup/info")
+def device_topup_info(auth: DeviceAuth = Depends(require_device_user)):
+    del auth
+    return {
+        "mode": "manual",
+        "minimum_rm": settings.min_topup_rm,
+        "minimum_credits": settings.min_topup_rm * CREDITS_PER_RM,
+        "credit_value_sen": 1,
+        "future_provider": "ToyyibPay",
+        "online_topup_enabled": False,
+        "message": f"Top up kini dibuat secara manual. Minimum RM{settings.min_topup_rm} = {settings.min_topup_rm * CREDITS_PER_RM} kredit.",
+    }
+
+
+@app.post("/v1/device/ai/estimate")
+def device_ai_estimate(payload: AIEstimateIn, auth: DeviceAuth = Depends(require_device_user), db: Session = Depends(get_db)):
+    account = auth.account
+    if payload.external_user_id != account.external_user_id:
+        raise HTTPException(status_code=403, detail={"code": "USER_MISMATCH", "message": "ID dompet peranti tidak sepadan."})
+    price = get_default_ai_price(db)
+    payload.model = price.model
+    estimated_input = reservation_input_tokens(payload.input, payload.instructions)
+    reserve_micros = charge_for_tokens(
+        estimated_input, payload.max_output_tokens,
+        input_rate=price.input_micros_per_million,
+        output_rate=price.output_micros_per_million,
+        markup_bps=price.markup_bps,
+    )
+    estimate_credits = micros_to_credits(reserve_micros)
+    wallet_row = _device_wallet_for_auth(db, auth)
+    balance_credits = micros_to_credits(wallet_row.balance_micros)
+    token = _make_estimate_token(
+        app_id=str(auth.client.id), user_id=account.external_user_id,
+        fingerprint=_estimate_fingerprint(payload), estimate_credits=estimate_credits,
+    )
+    return {
+        "ok": True,
+        "model": price.model,
+        "estimate_credits": estimate_credits,
+        "display_price_rm": credits_to_rm_display(estimate_credits),
+        "price_multiplier": settings.consumer_price_multiplier,
+        "balance_credits": balance_credits,
+        "balance_after_estimate_credits": max(0, balance_credits - estimate_credits),
+        "estimate_token": token,
+        "expires_in_seconds": settings.estimate_ttl_seconds,
+        "note": "Anggaran belum menolak kredit. Selepas persetujuan, baki Device Wallet disemak semula sebelum AI dipanggil.",
+    }
+
+
+@app.post("/v1/device/ai/chat")
+def device_ai_chat(payload: AIChatIn, auth: DeviceAuth = Depends(require_device_user), db: Session = Depends(get_db)):
+    account = auth.account
+    if payload.external_user_id != account.external_user_id:
+        raise HTTPException(status_code=403, detail={"code": "USER_MISMATCH", "message": "ID dompet peranti tidak sepadan."})
+    if not payload.estimate_token:
+        raise HTTPException(status_code=409, detail={"code": "ESTIMATE_REQUIRED", "message": "Anggaran kredit mesti dipaparkan dan diluluskan sebelum transaksi AI."})
+
+    price = get_default_ai_price(db)
+    payload.model = price.model
+    quote = _read_estimate_token(payload.estimate_token)
+    if quote.get("app_id") != str(auth.client.id) or quote.get("user_id") != account.external_user_id or quote.get("fp") != _estimate_fingerprint(payload):
+        raise HTTPException(status_code=409, detail={"code": "ESTIMATE_MISMATCH", "message": "Maklumat atau model berubah selepas anggaran. Sila anggar semula."})
+
+    current_reserve = charge_for_tokens(
+        reservation_input_tokens(payload.input, payload.instructions), payload.max_output_tokens,
+        input_rate=price.input_micros_per_million,
+        output_rate=price.output_micros_per_million,
+        markup_bps=price.markup_bps,
+    )
+    current_credits = micros_to_credits(current_reserve)
+    if current_credits > int(quote.get("credits", 0)):
+        raise HTTPException(status_code=409, detail={"code": "ESTIMATE_CHANGED", "message": "Anggaran harga telah berubah. Sila semak anggaran baharu sebelum meneruskan."})
+
+    hub = _device_wallet_hub(db)
+    return _ai_chat_core(payload, client=auth.client, wallet_app_id=hub.id, db=db)
+
+
+@app.get("/v1/admin/device-wallets", dependencies=[Depends(require_admin)])
+def admin_device_wallets(limit: int = Query(default=200, ge=1, le=1000), db: Session = Depends(get_db)):
+    hub = _device_wallet_hub(db)
+    accounts = db.scalars(select(DeviceAccount).order_by(DeviceAccount.created_at.desc()).limit(limit)).all()
+    result = []
+    for account in accounts:
+        wallet_row = db.scalar(select(Wallet).where(
+            Wallet.app_id == hub.id,
+            Wallet.external_user_id == account.external_user_id,
+        ))
+        linked_apps = db.execute(select(AppClient.name).join(DeviceAppLink, DeviceAppLink.app_id == AppClient.id).where(
+            DeviceAppLink.device_account_id == account.id,
+        ).order_by(AppClient.name)).scalars().all()
+        used = db.scalar(select(func.coalesce(func.sum(UsageRecord.charged_micros), 0)).where(
+            UsageRecord.external_user_id == account.external_user_id,
+        )) or 0
+        result.append({
+            "device_account_id": account.external_user_id,
+            "device_hash_prefix": account.device_id_hash[:12],
+            "balance_credits": micros_to_credits(wallet_row.balance_micros if wallet_row else 0),
+            "used_credits": micros_to_credits(used),
+            "trial_credits": account.trial_credits,
+            "migrated_from_legacy": account.migrated_from_legacy,
+            "linked_apps": list(linked_apps),
+            "created_at": account.created_at,
+            "last_seen_at": account.last_seen_at,
+        })
+    return result
+
+
+@app.post("/v1/admin/device-wallets/topup-credits", dependencies=[Depends(require_admin)])
+def admin_device_wallet_topup(payload: DeviceTopUpCreditsIn, db: Session = Depends(get_db)):
+    minimum = settings.min_topup_rm * CREDITS_PER_RM
+    if payload.credits < minimum:
+        raise HTTPException(status_code=422, detail={
+            "code": "MINIMUM_TOPUP",
+            "message": f"Top up minimum RM{settings.min_topup_rm} = {minimum} kredit.",
+        })
+    account = db.scalar(select(DeviceAccount).where(
+        DeviceAccount.external_user_id == payload.external_user_id,
+        DeviceAccount.active.is_(True),
+    ))
+    if not account:
+        raise HTTPException(status_code=404, detail={"code": "DEVICE_WALLET_NOT_FOUND", "message": "Dompet peranti tidak ditemui."})
+    hub = _device_wallet_hub(db)
+    existing = db.scalar(select(LedgerEntry).where(
+        LedgerEntry.app_id == hub.id,
+        LedgerEntry.idempotency_key == payload.idempotency_key,
+    ))
+    if existing:
+        return {
+            "ok": True,
+            "duplicate": True,
+            "balance_credits": micros_to_credits(existing.balance_after_micros),
+        }
+    wallet_row = get_or_create_wallet(db, hub.id, account.external_user_id)
+    amount = credits_to_micros(payload.credits)
+    wallet_row.balance_micros += amount
+    db.add(LedgerEntry(
+        app_id=hub.id,
+        wallet_id=wallet_row.id,
+        kind="topup",
+        amount_micros=amount,
+        balance_after_micros=wallet_row.balance_micros,
+        idempotency_key=payload.idempotency_key,
+        note=payload.note or "Top up manual Device Wallet",
+    ))
+    db.commit()
+    return {
+        "ok": True,
+        "duplicate": False,
+        "added_credits": payload.credits,
+        "balance_credits": micros_to_credits(wallet_row.balance_micros),
+    }
 
 
 # ----------------------------- User Registration -----------------------------
@@ -1124,8 +1538,7 @@ def ai_models(client: AppClient = Depends(require_app), db: Session = Depends(ge
     } for x in rows]
 
 
-@app.post("/v1/ai/chat")
-def ai_chat(payload: AIChatIn, client: AppClient = Depends(require_app), db: Session = Depends(get_db)):
+def _ai_chat_core(payload: AIChatIn, *, client: AppClient, wallet_app_id, db: Session):
     existing = db.scalar(select(AIRequest).where(
         AIRequest.app_id == client.id,
         AIRequest.idempotency_key == payload.idempotency_key,
@@ -1146,7 +1559,7 @@ def ai_chat(payload: AIChatIn, client: AppClient = Depends(require_app), db: Ses
 
     # Phase 1: reserve enough wallet credit before incurring provider cost.
     try:
-        wallet_row = get_or_create_wallet(db, client.id, payload.external_user_id)
+        wallet_row = get_or_create_wallet(db, wallet_app_id, payload.external_user_id)
         if wallet_row.balance_micros < reserve_micros:
             current_balance = wallet_row.balance_micros
             db.rollback()
@@ -1289,3 +1702,8 @@ def ai_chat(payload: AIChatIn, client: AppClient = Depends(require_app), db: Ses
         "balance_rm": micros_to_rm(wallet_row.balance_micros),
         "balance_credits": micros_to_credits(wallet_row.balance_micros),
     }
+
+
+@app.post("/v1/ai/chat")
+def ai_chat(payload: AIChatIn, client: AppClient = Depends(require_app), db: Session = Depends(get_db)):
+    return _ai_chat_core(payload, client=client, wallet_app_id=client.id, db=db)

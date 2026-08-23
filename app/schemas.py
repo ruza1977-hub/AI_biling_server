@@ -98,3 +98,15 @@ class TopUpCreditsIn(BaseModel):
     credits: int = Field(gt=0, le=10_000_000)
     idempotency_key: str = Field(min_length=8, max_length=160)
     note: str | None = None
+
+
+class DeviceBootstrapIn(BaseModel):
+    app_name: str = Field(min_length=2, max_length=120)
+    device_id: str = Field(min_length=6, max_length=300)
+
+
+class DeviceTopUpCreditsIn(BaseModel):
+    external_user_id: str = Field(min_length=1, max_length=160)
+    credits: int = Field(gt=0, le=10_000_000)
+    idempotency_key: str = Field(min_length=8, max_length=160)
+    note: str | None = None
