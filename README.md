@@ -1,70 +1,86 @@
-# AI Billing Server v0.7
+# AI Billing Server v0.9.0 — Shared Device Wallet
 
-FastAPI + PostgreSQL untuk billing AI OPR Android.
+Versi ini menukar aliran pengguna daripada akaun e-mel/kata laluan kepada **Device Wallet**.
 
-## Prinsip kredit
-- 1 kredit = 1 sen.
-- Akaun baharu menerima 50 kredit sekali sahaja.
-- Top up minimum RM10 = 1,000 kredit.
-- Harga pengguna AI = kos sebenar penyedia dalam RM × `CONSUMER_PRICE_MULTIPLIER` (lalai 10), kemudian dibundarkan kepada kredit penuh.
-- Sebelum AI dipanggil, server mengeluarkan anggaran bertandatangan. Baki diperiksa semula selepas pengguna bersetuju.
+## Prinsip
 
-## Akaun v0.7
-Pengguna mempunyai dompet kekal berdasarkan akaun e-mel.
+`1 peranti = 1 Device Wallet = banyak aplikasi`
 
-### Pengguna baharu
-`POST /v1/public/register`
+Aplikasi yang disokong secara lalai:
 
-```json
-{
-  "app_name": "OPR Android",
-  "email": "guru@example.com",
-  "password": "kata-laluan-minimum-8",
-  "device_id": "android:..."
-}
-```
+- OPR Android
+- GBK Digital
+- SPK
+- StudyMate
 
-Pendaftaran pertama memberikan 50 kredit dan mengeluarkan token sesi.
+Semua aplikasi pada peranti yang sama boleh melihat dan menggunakan baki kredit yang sama, dengan syarat aplikasi Android menggunakan signing certificate/keystore yang sama supaya `ANDROID_ID` konsisten antara aplikasi.
 
-### Log masuk
-`POST /v1/public/login`
+## Auto login
+
+Klien menghantar:
 
 ```json
 {
   "app_name": "OPR Android",
-  "email": "guru@example.com",
-  "password": "kata-laluan-minimum-8",
   "device_id": "android:..."
 }
 ```
 
-Log masuk tidak menghasilkan bonus baharu. Token sesi baharu dikeluarkan untuk peranti tersebut dan dompet lama terus digunakan.
+ke:
 
-### Akaun lama v0.5
-Rekod lama tidak mempunyai kata laluan. Jika pengguna menjalankan `register` menggunakan e-mel lama pada peranti yang pernah dikenal pasti, server menetapkan kata laluan pada akaun lama dan memulangkan dompet lama tanpa 50 kredit tambahan.
+`POST /v1/device/bootstrap`
 
-Jika peranti asal sudah tiada, pentadbir boleh menggunakan endpoint terlindung `POST /v1/admin/users/set-password` dengan `X-Admin-Key`. Ini ialah pemulihan manual sehingga pengesahan e-mel automatik ditambah pada versi akan datang.
+Server hanya menyimpan HMAC hash bagi ID peranti. Jika Device Wallet sudah wujud, server mengeluarkan token sesi baharu. Tiada e-mel atau kata laluan diperlukan.
 
-## Keselamatan kata laluan
-- Hash Argon2id (`argon2-cffi`).
-- Kata laluan mentah tidak disimpan dalam PostgreSQL.
-- ID peranti mentah tidak disimpan; server menyimpan HMAC hash.
-- Selepas 5 kata laluan salah, akaun dikunci sementara 15 minit.
-- Token pengguna v2 tamat selepas 30 hari secara lalai.
+## Kredit percubaan
 
-## Migrasi Railway
-Gantikan kod v0.5 dengan v0.7 dan deploy pada PostgreSQL yang sama. Jangan padam database.
+Peranti baharu menerima 50 kredit sekali sahaja. App kedua, ketiga atau keempat pada peranti yang sama tidak menerima bonus tambahan.
 
-Startup v0.7 menambah secara selamat:
-- `password_hash`
-- `password_set_at`
-- `failed_login_count`
-- `locked_until`
-- jadual `user_devices`
+## Migrasi pengguna OPR lama
 
-Wallet dan ledger lama tidak diubah.
+Apabila device yang pernah berdaftar dalam v0.3-v0.8 memanggil bootstrap buat kali pertama, server cuba:
 
-## Variables
+1. mencari pendaftaran lama berdasarkan hash peranti;
+2. mencipta Device Wallet;
+3. memindahkan baki semasa wallet lama ke Device Wallet;
+4. tidak memberi bonus 50 kredit kali kedua;
+5. mengekalkan rekod penggunaan AI lama di bawah ID Device Wallet baharu.
+
+Database PostgreSQL lama **jangan dipadam**.
+
+## Endpoint Device Wallet
+
+- `POST /v1/device/bootstrap`
+- `GET /v1/device/account/summary`
+- `GET /v1/device/usage/recent`
+- `GET /v1/device/topup/info`
+- `POST /v1/device/ai/estimate`
+- `POST /v1/device/ai/chat`
+
+Admin:
+
+- `GET /v1/admin/device-wallets`
+- `POST /v1/admin/device-wallets/topup-credits`
+
+## Top up manual
+
+Minimum top up masih RM10 = 1,000 kredit. ToyyibPay boleh ditambah kemudian tanpa mengubah konsep Device Wallet.
+
+Contoh body admin:
+
+```json
+{
+  "external_user_id": "dev_xxx",
+  "credits": 1000,
+  "idempotency_key": "manual-20260823-001",
+  "note": "Top up RM10"
+}
+```
+
+## Railway Variables
+
+Kekalkan:
+
 ```text
 DATABASE_URL=${{Postgres.DATABASE_URL}}
 MASTER_ADMIN_KEY=...
@@ -75,42 +91,21 @@ CONSUMER_PRICE_MULTIPLIER=10
 DEFAULT_AI_MODEL=gpt-5.6-luna
 DEVICE_HASH_SECRET=...
 USER_TOKEN_SECRET=...
-USER_TOKEN_DAYS=30
-LOGIN_MAX_ATTEMPTS=5
-LOGIN_LOCK_MINUTES=15
 ```
 
-## Health
-`GET /health`
-
-Sasaran:
-```json
-{
-  "ok": true,
-  "service": "AI Billing Server",
-  "version": "0.7.0",
-  "openai_configured": true
-}
-```
-
-
-## Lupa kata laluan / SMTP
-
-Server tidak menyimpan kata laluan asal. Endpoint lupa kata laluan menjana kata laluan sementara, menghantarnya ke e-mel akaun, dan mewajibkan pengguna menukar kata laluan selepas log masuk.
-
-Tetapkan pada Railway:
+Pilihan:
 
 ```text
-SMTP_HOST=smtp.gmail.com
-SMTP_PORT=587
-SMTP_USERNAME=alamat-penghantar@gmail.com
-SMTP_PASSWORD=<App Password / kata laluan SMTP>
-SMTP_FROM_EMAIL=alamat-penghantar@gmail.com
-SMTP_FROM_NAME=OPR Android
-SMTP_STARTTLS=true
-SMTP_USE_SSL=false
-PASSWORD_RESET_EXPIRY_MINUTES=30
-PASSWORD_RESET_COOLDOWN_MINUTES=3
+PUBLIC_DEVICE_APPS=OPR Android,GBK Digital,SPK,StudyMate
+DEVICE_WALLET_HUB_APP_NAME=__DEVICE_WALLET__
 ```
 
-Untuk Gmail, gunakan App Password; jangan gunakan kata laluan akaun Google biasa.
+Selepas deploy, `/health` sepatutnya menunjukkan:
+
+```json
+{
+  "version": "0.9.0",
+  "auth_mode": "device_wallet",
+  "shared_wallet": true
+}
+```
