@@ -1,4 +1,4 @@
-# AI Billing Server v0.6
+# AI Billing Server v0.7
 
 FastAPI + PostgreSQL untuk billing AI OPR Android.
 
@@ -9,7 +9,7 @@ FastAPI + PostgreSQL untuk billing AI OPR Android.
 - Harga pengguna AI = kos sebenar penyedia dalam RM × `CONSUMER_PRICE_MULTIPLIER` (lalai 10), kemudian dibundarkan kepada kredit penuh.
 - Sebelum AI dipanggil, server mengeluarkan anggaran bertandatangan. Baki diperiksa semula selepas pengguna bersetuju.
 
-## Akaun v0.6
+## Akaun v0.7
 Pengguna mempunyai dompet kekal berdasarkan akaun e-mel.
 
 ### Pengguna baharu
@@ -53,9 +53,9 @@ Jika peranti asal sudah tiada, pentadbir boleh menggunakan endpoint terlindung `
 - Token pengguna v2 tamat selepas 30 hari secara lalai.
 
 ## Migrasi Railway
-Gantikan kod v0.5 dengan v0.6 dan deploy pada PostgreSQL yang sama. Jangan padam database.
+Gantikan kod v0.5 dengan v0.7 dan deploy pada PostgreSQL yang sama. Jangan padam database.
 
-Startup v0.6 menambah secara selamat:
+Startup v0.7 menambah secara selamat:
 - `password_hash`
 - `password_set_at`
 - `failed_login_count`
@@ -88,7 +88,29 @@ Sasaran:
 {
   "ok": true,
   "service": "AI Billing Server",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "openai_configured": true
 }
 ```
+
+
+## Lupa kata laluan / SMTP
+
+Server tidak menyimpan kata laluan asal. Endpoint lupa kata laluan menjana kata laluan sementara, menghantarnya ke e-mel akaun, dan mewajibkan pengguna menukar kata laluan selepas log masuk.
+
+Tetapkan pada Railway:
+
+```text
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USERNAME=alamat-penghantar@gmail.com
+SMTP_PASSWORD=<App Password / kata laluan SMTP>
+SMTP_FROM_EMAIL=alamat-penghantar@gmail.com
+SMTP_FROM_NAME=OPR Android
+SMTP_STARTTLS=true
+SMTP_USE_SSL=false
+PASSWORD_RESET_EXPIRY_MINUTES=30
+PASSWORD_RESET_COOLDOWN_MINUTES=3
+```
+
+Untuk Gmail, gunakan App Password; jangan gunakan kata laluan akaun Google biasa.
