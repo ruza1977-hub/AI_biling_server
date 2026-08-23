@@ -111,6 +111,23 @@ class UserRegistration(Base):
     external_user_id: Mapped[str] = mapped_column(String(80), index=True, nullable=False)
     trial_granted: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     trial_credits: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    password_hash: Mapped[str | None] = mapped_column(String(255))
+    password_set_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    failed_login_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class UserDevice(Base):
+    __tablename__ = "user_devices"
+    __table_args__ = (
+        UniqueConstraint("app_id", "external_user_id", "device_id_hash", name="uq_user_device_link"),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    app_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("app_clients.id", ondelete="CASCADE"), index=True)
+    external_user_id: Mapped[str] = mapped_column(String(80), index=True, nullable=False)
+    device_id_hash: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

@@ -67,6 +67,20 @@ class RegisterUserIn(BaseModel):
 
 class PublicRegisterUserIn(RegisterUserIn):
     app_name: str = Field(min_length=2, max_length=120)
+    password: str = Field(min_length=8, max_length=128)
+
+
+class PublicLoginUserIn(BaseModel):
+    app_name: str = Field(min_length=2, max_length=120)
+    email: str = Field(min_length=5, max_length=254)
+    password: str = Field(min_length=8, max_length=128)
+    device_id: str = Field(min_length=6, max_length=300)
+
+
+class AdminSetPasswordIn(BaseModel):
+    app_name: str = Field(min_length=2, max_length=120)
+    email: str = Field(min_length=5, max_length=254)
+    new_password: str = Field(min_length=8, max_length=128)
 
 
 class TopUpCreditsIn(BaseModel):

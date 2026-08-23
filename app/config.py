@@ -16,6 +16,9 @@ class Settings(BaseSettings):
     min_topup_rm: int = 10
     consumer_price_multiplier: int = 10
     default_ai_model: str = "gpt-5.6-luna"
+    user_token_days: int = 30
+    login_max_attempts: int = 5
+    login_lock_minutes: int = 15
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

@@ -3,15 +3,21 @@ import hashlib
 import hmac
 import json
 import secrets
+import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
+from argon2 import PasswordHasher
+from argon2.exceptions import InvalidHashError, VerifyMismatchError
 from fastapi import Depends, Header, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .config import settings
 from .db import SessionLocal
-from .models import AppClient, UserRegistration
+from .models import AppClient, UserDevice, UserRegistration
+
+_password_hasher = PasswordHasher(time_cost=3, memory_cost=65536, parallelism=2, hash_len=32, salt_len=16)
 
 
 def get_db():
@@ -51,6 +57,28 @@ def device_hash(value: str) -> str:
     return hmac.new(secret, value.strip().encode("utf-8"), hashlib.sha256).hexdigest()
 
 
+def hash_password(value: str) -> str:
+    return _password_hasher.hash(value)
+
+
+def verify_password(stored_hash: str | None, supplied: str) -> bool:
+    if not stored_hash:
+        return False
+    try:
+        return _password_hasher.verify(stored_hash, supplied)
+    except (VerifyMismatchError, InvalidHashError, ValueError):
+        return False
+
+
+def password_needs_rehash(stored_hash: str | None) -> bool:
+    if not stored_hash:
+        return False
+    try:
+        return _password_hasher.check_needs_rehash(stored_hash)
+    except (InvalidHashError, ValueError):
+        return False
+
+
 def _token_secret() -> bytes:
     return (settings.user_token_secret or settings.master_admin_key).encode("utf-8")
 
@@ -63,12 +91,15 @@ def _b64url_decode(value: str) -> bytes:
     return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
 
 
-def create_user_token(reg: UserRegistration) -> str:
+def create_user_token(reg: UserRegistration, *, current_device_hash: str | None = None) -> str:
+    now = int(time.time())
     payload = {
-        "v": 1,
+        "v": 2,
         "app_id": str(reg.app_id),
         "user_id": reg.external_user_id,
-        "device_hash": reg.device_id_hash,
+        "device_hash": current_device_hash or reg.device_id_hash,
+        "iat": now,
+        "exp": now + int(settings.user_token_days) * 86400,
     }
     encoded = _b64url_encode(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"))
     sig = hmac.new(_token_secret(), encoded.encode("ascii"), hashlib.sha256).digest()
@@ -87,9 +118,10 @@ def require_user(
     db: Session = Depends(get_db),
 ) -> UserAuth:
     if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail={"code": "USER_TOKEN_REQUIRED", "message": "Token pengguna diperlukan."})
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail={"code": "USER_TOKEN_REQUIRED", "message": "Sila log masuk semula."})
     if not x_device_id:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail={"code": "DEVICE_ID_REQUIRED", "message": "ID peranti diperlukan."})
+
     token = authorization[7:].strip()
     try:
         encoded, sig_text = token.split(".", 1)
@@ -98,24 +130,46 @@ def require_user(
         if not hmac.compare_digest(expected, supplied):
             raise ValueError("signature")
         payload = json.loads(_b64url_decode(encoded).decode("utf-8"))
+        version = int(payload.get("v", 1))
         app_id = payload["app_id"]
         user_id = payload["user_id"]
         token_device_hash = payload["device_hash"]
+        if version >= 2 and int(payload.get("exp", 0)) < int(time.time()):
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail={"code": "TOKEN_EXPIRED", "message": "Sesi telah tamat. Sila log masuk semula menggunakan e-mel dan kata laluan."})
+    except HTTPException:
+        raise
     except Exception:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail={"code": "INVALID_USER_TOKEN", "message": "Token pengguna tidak sah."})
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail={"code": "INVALID_USER_TOKEN", "message": "Sesi tidak sah. Sila log masuk semula."})
 
     current_device_hash = device_hash(x_device_id)
     if not hmac.compare_digest(token_device_hash, current_device_hash):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail={"code": "DEVICE_MISMATCH", "message": "Token ini bukan untuk peranti ini."})
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail={"code": "DEVICE_MISMATCH", "message": "Sesi ini bukan untuk peranti ini. Sila log masuk semula."})
 
     reg = db.scalar(select(UserRegistration).where(
         UserRegistration.app_id == app_id,
         UserRegistration.external_user_id == user_id,
-        UserRegistration.device_id_hash == current_device_hash,
         UserRegistration.active.is_(True),
     ))
     if not reg:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail={"code": "USER_NOT_FOUND", "message": "Pendaftaran pengguna tidak aktif."})
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail={"code": "USER_NOT_FOUND", "message": "Akaun pengguna tidak aktif."})
+
+    # Token v2 diwujudkan selepas login/pendaftaran dan peranti mesti pernah dipautkan.
+    # Token v1 lama masih diterima pada peranti pendaftaran asal untuk migrasi tanpa memutuskan pengguna.
+    if int(payload.get("v", 1)) >= 2:
+        link = db.scalar(select(UserDevice).where(
+            UserDevice.app_id == reg.app_id,
+            UserDevice.external_user_id == reg.external_user_id,
+            UserDevice.device_id_hash == current_device_hash,
+        ))
+        if not link:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail={"code": "DEVICE_NOT_LINKED", "message": "Peranti ini belum dipautkan. Sila log masuk semula."})
+        link.last_seen_at = datetime.now(timezone.utc)
+        reg.last_seen_at = datetime.now(timezone.utc)
+        db.commit()
+    else:
+        if not hmac.compare_digest(reg.device_id_hash, current_device_hash):
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail={"code": "DEVICE_MISMATCH", "message": "Sila log masuk semula."})
+
     client = db.scalar(select(AppClient).where(AppClient.id == reg.app_id, AppClient.active.is_(True)))
     if not client:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail={"code": "APP_INACTIVE", "message": "Aplikasi tidak aktif."})

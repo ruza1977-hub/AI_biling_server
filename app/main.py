@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import base64
 import json
 import time
@@ -12,17 +12,17 @@ import re
 import uuid
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .config import settings
 from .db import Base, engine, SessionLocal
-from .models import AIRequest, AppClient, LedgerEntry, ModelPrice, UsageRecord, UserRegistration, Wallet
+from .models import AIRequest, AppClient, LedgerEntry, ModelPrice, UsageRecord, UserDevice, UserRegistration, Wallet
 from .openai_gateway import OpenAIGatewayError, create_response
-from .schemas import AIEstimateIn, AIChatIn, ChargeIn, PricingIn, PublicRegisterUserIn, RegisterAppIn, RegisterAppOut, RegisterUserIn, TopUpCreditsIn, TopUpIn
-from .security import UserAuth, create_user_token, device_hash, generate_api_key, get_db, hash_api_key, require_admin, require_app, require_user
+from .schemas import AdminSetPasswordIn, AIEstimateIn, AIChatIn, ChargeIn, PricingIn, PublicLoginUserIn, PublicRegisterUserIn, RegisterAppIn, RegisterAppOut, RegisterUserIn, TopUpCreditsIn, TopUpIn
+from .security import UserAuth, create_user_token, device_hash, generate_api_key, get_db, hash_api_key, hash_password, password_needs_rehash, require_admin, require_app, require_user, verify_password
 
 MICROS_PER_RM = 1_000_000
 MICROS_PER_CREDIT = 10_000  # 1 kredit = RM0.01 = 1 sen
@@ -32,9 +32,31 @@ TOKENS_PER_MILLION = 1_000_000
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    # v0.4 preserves all prior data and ensures the public OPR application identity exists.
+    # v0.6 preserves every existing wallet/ledger row. create_all creates new tables,
+    # while the explicit ALTER statements safely add auth columns to an existing database.
+    Base.metadata.create_all(bind=engine)
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE user_registrations ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255)"))
+        conn.execute(text("ALTER TABLE user_registrations ADD COLUMN IF NOT EXISTS password_set_at TIMESTAMPTZ"))
+        conn.execute(text("ALTER TABLE user_registrations ADD COLUMN IF NOT EXISTS failed_login_count INTEGER NOT NULL DEFAULT 0"))
+        conn.execute(text("ALTER TABLE user_registrations ADD COLUMN IF NOT EXISTS locked_until TIMESTAMPTZ"))
+    # user_devices depends only on existing columns, so create again after the migration.
     Base.metadata.create_all(bind=engine)
     with SessionLocal() as db:
+        # Backfill the registration device for accounts created before v0.6.
+        for reg in db.scalars(select(UserRegistration)).all():
+            link = db.scalar(select(UserDevice).where(
+                UserDevice.app_id == reg.app_id,
+                UserDevice.external_user_id == reg.external_user_id,
+                UserDevice.device_id_hash == reg.device_id_hash,
+            ))
+            if link is None:
+                db.add(UserDevice(
+                    app_id=reg.app_id, external_user_id=reg.external_user_id,
+                    device_id_hash=reg.device_id_hash,
+                    first_seen_at=reg.created_at, last_seen_at=reg.last_seen_at,
+                ))
+        db.commit()
         app_row = db.scalar(select(AppClient).where(AppClient.name == settings.public_opr_app_name))
         if app_row is None:
             raw_key = generate_api_key()
@@ -43,7 +65,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title=settings.service_name, version="0.5.0", lifespan=lifespan)
+app = FastAPI(title=settings.service_name, version="0.6.0", lifespan=lifespan)
 
 
 def micros_to_rm(value: int) -> str:
@@ -121,6 +143,7 @@ def registration_response(reg: UserRegistration, db: Session, *, duplicate: bool
         "email": reg.email_normalized,
         "balance_credits": micros_to_credits(balance),
         "balance_rm": micros_to_rm(balance),
+        "password_configured": bool(reg.password_hash),
     }
 
 
@@ -213,7 +236,7 @@ def health():
     return {
         "ok": True,
         "service": settings.service_name,
-        "version": "0.5.0",
+        "version": "0.6.0",
         "openai_configured": bool(settings.openai_api_key),
         "default_ai_model": settings.default_ai_model,
         "consumer_price_multiplier": settings.consumer_price_multiplier,
@@ -342,6 +365,26 @@ def topup_credits(payload: TopUpCreditsIn, db: Session = Depends(get_db)):
     }
 
 
+@app.post("/v1/admin/users/set-password", dependencies=[Depends(require_admin)])
+def admin_set_user_password(payload: AdminSetPasswordIn, db: Session = Depends(get_db)):
+    client = db.scalar(select(AppClient).where(AppClient.name == payload.app_name, AppClient.active.is_(True)))
+    if not client:
+        raise HTTPException(status_code=404, detail={"code": "APP_NOT_FOUND", "message": "Aplikasi tidak ditemui."})
+    email = normalize_email(payload.email)
+    reg = db.scalar(select(UserRegistration).where(
+        UserRegistration.app_id == client.id,
+        UserRegistration.email_normalized == email,
+    ))
+    if not reg:
+        raise HTTPException(status_code=404, detail={"code": "ACCOUNT_NOT_FOUND", "message": "Akaun e-mel tidak ditemui."})
+    reg.password_hash = hash_password(payload.new_password)
+    reg.password_set_at = datetime.now(timezone.utc)
+    reg.failed_login_count = 0
+    reg.locked_until = None
+    db.commit()
+    return {"ok": True, "email": reg.email_normalized, "external_user_id": reg.external_user_id, "password_configured": True}
+
+
 @app.get("/v1/admin/users", dependencies=[Depends(require_admin)])
 def admin_users(
     limit: int = Query(default=200, ge=1, le=1000),
@@ -360,6 +403,7 @@ def admin_users(
         "external_user_id": reg.external_user_id,
         "device_id_hash_prefix": reg.device_id_hash[:12],
         "trial_credits": reg.trial_credits, "trial_granted": reg.trial_granted,
+        "password_configured": bool(reg.password_hash),
         "balance_credits": micros_to_credits(balance),
         "balance_rm": micros_to_rm(balance),
         "created_at": reg.created_at, "last_seen_at": reg.last_seen_at,
@@ -551,28 +595,94 @@ def register_user(payload: RegisterUserIn, client: AppClient = Depends(require_a
 
 
 
+def _link_user_device(db: Session, reg: UserRegistration, device_hash_value: str) -> None:
+    link = db.scalar(select(UserDevice).where(
+        UserDevice.app_id == reg.app_id,
+        UserDevice.external_user_id == reg.external_user_id,
+        UserDevice.device_id_hash == device_hash_value,
+    ))
+    now = datetime.now(timezone.utc)
+    if link is None:
+        db.add(UserDevice(
+            app_id=reg.app_id,
+            external_user_id=reg.external_user_id,
+            device_id_hash=device_hash_value,
+            first_seen_at=now,
+            last_seen_at=now,
+        ))
+    else:
+        link.last_seen_at = now
+
+
+def _device_has_any_account(db: Session, app_id, device_hash_value: str) -> bool:
+    if db.scalar(select(UserDevice.id).where(
+        UserDevice.app_id == app_id,
+        UserDevice.device_id_hash == device_hash_value,
+    )):
+        return True
+    # Covers v0.5 rows before the startup backfill completes.
+    return db.scalar(select(UserRegistration.id).where(
+        UserRegistration.app_id == app_id,
+        UserRegistration.device_id_hash == device_hash_value,
+    )) is not None
+
+
+def _device_belongs_to_registration(db: Session, reg: UserRegistration, device_hash_value: str) -> bool:
+    if hmac.compare_digest(reg.device_id_hash, device_hash_value):
+        return True
+    return db.scalar(select(UserDevice.id).where(
+        UserDevice.app_id == reg.app_id,
+        UserDevice.external_user_id == reg.external_user_id,
+        UserDevice.device_id_hash == device_hash_value,
+    )) is not None
+
+
 @app.post("/v1/public/register")
 def public_register_user(payload: PublicRegisterUserIn, db: Session = Depends(get_db)):
+    """Create a new account, or activate a password for a legacy pre-v0.6 account.
+
+    A legacy account can only set its first password from a device already associated
+    with that account. This prevents somebody who merely knows an email address from
+    claiming an old wallet.
+    """
     client = db.scalar(select(AppClient).where(AppClient.name == payload.app_name, AppClient.active.is_(True)))
     if not client:
         raise HTTPException(status_code=404, detail={"code": "APP_NOT_FOUND", "message": "Aplikasi tidak didaftarkan pada server."})
+
     email = normalize_email(payload.email)
     device_hash_value = hash_device_id(payload.device_id)
-    existing_email = db.scalar(select(UserRegistration).where(
-        UserRegistration.app_id == client.id, UserRegistration.email_normalized == email))
-    existing_device = db.scalar(select(UserRegistration).where(
-        UserRegistration.app_id == client.id, UserRegistration.device_id_hash == device_hash_value))
+    existing = db.scalar(select(UserRegistration).where(
+        UserRegistration.app_id == client.id,
+        UserRegistration.email_normalized == email,
+    ))
 
-    if existing_email or existing_device:
-        if existing_email and existing_device and existing_email.id == existing_device.id:
-            existing_email.last_seen_at = datetime.now(timezone.utc)
-            db.commit()
-            result = registration_response(existing_email, db, duplicate=True, trial_granted_now=False)
-            result["access_token"] = create_user_token(existing_email)
-            return result
+    if existing:
+        if existing.password_hash:
+            raise HTTPException(status_code=409, detail={
+                "code": "ACCOUNT_EXISTS",
+                "message": "Akaun ini sudah mempunyai kata laluan. Gunakan Log Masuk.",
+            })
+        if not _device_belongs_to_registration(db, existing, device_hash_value):
+            raise HTTPException(status_code=409, detail={
+                "code": "LEGACY_ACCOUNT_ORIGINAL_DEVICE_REQUIRED",
+                "message": "Akaun lama ini belum mempunyai kata laluan. Aktifkan kata laluan pada peranti yang pernah digunakan untuk akaun ini.",
+            })
+        existing.password_hash = hash_password(payload.password)
+        existing.password_set_at = datetime.now(timezone.utc)
+        existing.last_seen_at = datetime.now(timezone.utc)
+        existing.failed_login_count = 0
+        existing.locked_until = None
+        _link_user_device(db, existing, device_hash_value)
+        db.commit()
+        result = registration_response(existing, db, duplicate=True, trial_granted_now=False)
+        result["legacy_activated"] = True
+        result["access_token"] = create_user_token(existing, current_device_hash=device_hash_value)
+        return result
+
+    if _device_has_any_account(db, client.id, device_hash_value):
         raise HTTPException(status_code=409, detail={
-            "code": "REGISTRATION_ALREADY_USED",
-            "message": "E-mel atau peranti ini telah digunakan untuk pendaftaran percubaan aplikasi ini.",
+            "code": "DEVICE_TRIAL_ALREADY_USED",
+            "message": "Peranti ini telah digunakan untuk akaun OPR. Log masuk ke akaun sedia ada; bonus 50 kredit tidak boleh dituntut berulang.",
         })
 
     reg = UserRegistration(
@@ -582,11 +692,15 @@ def public_register_user(payload: PublicRegisterUserIn, db: Session = Depends(ge
         external_user_id="usr_" + uuid.uuid4().hex,
         trial_granted=True,
         trial_credits=settings.trial_credits,
+        password_hash=hash_password(payload.password),
+        password_set_at=datetime.now(timezone.utc),
+        failed_login_count=0,
         last_seen_at=datetime.now(timezone.utc),
     )
     try:
         db.add(reg)
         db.flush()
+        _link_user_device(db, reg, device_hash_value)
         wallet_row = get_or_create_wallet(db, client.id, reg.external_user_id)
         bonus = credits_to_micros(settings.trial_credits)
         wallet_row.balance_micros += bonus
@@ -598,22 +712,66 @@ def public_register_user(payload: PublicRegisterUserIn, db: Session = Depends(ge
         db.commit()
         db.refresh(reg)
         result = registration_response(reg, db, duplicate=False, trial_granted_now=True)
-        result["access_token"] = create_user_token(reg)
+        result["legacy_activated"] = False
+        result["access_token"] = create_user_token(reg, current_device_hash=device_hash_value)
         return result
     except IntegrityError:
         db.rollback()
-        existing_email = db.scalar(select(UserRegistration).where(
-            UserRegistration.app_id == client.id, UserRegistration.email_normalized == email))
-        existing_device = db.scalar(select(UserRegistration).where(
-            UserRegistration.app_id == client.id, UserRegistration.device_id_hash == device_hash_value))
-        if existing_email and existing_device and existing_email.id == existing_device.id:
-            result = registration_response(existing_email, db, duplicate=True, trial_granted_now=False)
-            result["access_token"] = create_user_token(existing_email)
-            return result
         raise HTTPException(status_code=409, detail={
-            "code": "REGISTRATION_ALREADY_USED",
-            "message": "E-mel atau peranti ini telah digunakan untuk pendaftaran percubaan aplikasi ini.",
+            "code": "REGISTRATION_CONFLICT",
+            "message": "Akaun atau peranti ini telah didaftarkan. Cuba Log Masuk.",
         })
+
+
+@app.post("/v1/public/login")
+def public_login_user(payload: PublicLoginUserIn, db: Session = Depends(get_db)):
+    client = db.scalar(select(AppClient).where(AppClient.name == payload.app_name, AppClient.active.is_(True)))
+    if not client:
+        raise HTTPException(status_code=404, detail={"code": "APP_NOT_FOUND", "message": "Aplikasi tidak didaftarkan pada server."})
+    email = normalize_email(payload.email)
+    reg = db.scalar(select(UserRegistration).where(
+        UserRegistration.app_id == client.id,
+        UserRegistration.email_normalized == email,
+        UserRegistration.active.is_(True),
+    ))
+    if not reg:
+        raise HTTPException(status_code=404, detail={"code": "ACCOUNT_NOT_FOUND", "message": "Akaun e-mel ini belum didaftarkan."})
+    if not reg.password_hash:
+        raise HTTPException(status_code=409, detail={
+            "code": "PASSWORD_NOT_SET",
+            "message": "Akaun ini dibuat sebelum sistem kata laluan. Pada peranti asal, tekan Daftar / Aktifkan Akaun Lama untuk menetapkan kata laluan tanpa kehilangan dompet.",
+        })
+
+    now = datetime.now(timezone.utc)
+    if reg.locked_until and reg.locked_until > now:
+        seconds = max(1, int((reg.locked_until - now).total_seconds()))
+        raise HTTPException(status_code=429, detail={
+            "code": "LOGIN_TEMPORARILY_LOCKED",
+            "message": f"Terlalu banyak percubaan kata laluan. Cuba lagi dalam kira-kira {max(1, seconds // 60)} minit.",
+        })
+
+    if not verify_password(reg.password_hash, payload.password):
+        reg.failed_login_count = int(reg.failed_login_count or 0) + 1
+        if reg.failed_login_count >= settings.login_max_attempts:
+            reg.locked_until = now + timedelta(minutes=settings.login_lock_minutes)
+            reg.failed_login_count = 0
+        db.commit()
+        raise HTTPException(status_code=401, detail={"code": "INVALID_CREDENTIALS", "message": "E-mel atau kata laluan tidak betul."})
+
+    if password_needs_rehash(reg.password_hash):
+        reg.password_hash = hash_password(payload.password)
+        reg.password_set_at = now
+    reg.failed_login_count = 0
+    reg.locked_until = None
+    reg.last_seen_at = now
+    device_hash_value = hash_device_id(payload.device_id)
+    _link_user_device(db, reg, device_hash_value)
+    db.commit()
+
+    result = registration_response(reg, db, duplicate=True, trial_granted_now=False)
+    result["access_token"] = create_user_token(reg, current_device_hash=device_hash_value)
+    result["login"] = True
+    return result
 
 
 @app.get("/v1/user/models")
