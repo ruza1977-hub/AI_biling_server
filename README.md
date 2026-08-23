@@ -1,81 +1,94 @@
-# AI Billing Server v0.5
+# AI Billing Server v0.6
 
-Billing + AI Gateway untuk OPR Android dan aplikasi lain.
+FastAPI + PostgreSQL untuk billing AI OPR Android.
 
-## Standard kredit
+## Prinsip kredit
+- 1 kredit = 1 sen.
+- Akaun baharu menerima 50 kredit sekali sahaja.
+- Top up minimum RM10 = 1,000 kredit.
+- Harga pengguna AI = kos sebenar penyedia dalam RM × `CONSUMER_PRICE_MULTIPLIER` (lalai 10), kemudian dibundarkan kepada kredit penuh.
+- Sebelum AI dipanggil, server mengeluarkan anggaran bertandatangan. Baki diperiksa semula selepas pengguna bersetuju.
 
-- 1 kredit = RM0.01 = 1 sen
-- Pendaftaran baharu menerima 50 kredit sekali sahaja
-- Top up minimum = RM10 = 1,000 kredit
-- Top up sekarang manual
-- ToyyibPay dirancang untuk fasa akan datang
+## Akaun v0.6
+Pengguna mempunyai dompet kekal berdasarkan akaun e-mel.
 
-## Harga pengguna v0.5
+### Pengguna baharu
+`POST /v1/public/register`
 
-Harga yang dikenakan kepada pengguna dikira di server:
+```json
+{
+  "app_name": "OPR Android",
+  "email": "guru@example.com",
+  "password": "kata-laluan-minimum-8",
+  "device_id": "android:..."
+}
+```
 
-`kos sebenar penyedia dalam RM × 10 = harga pengguna`
+Pendaftaran pertama memberikan 50 kredit dan mengeluarkan token sesi.
 
-Harga pengguna kemudian dibundarkan ke kredit penuh kerana 1 kredit = 1 sen.
+### Log masuk
+`POST /v1/public/login`
 
-Contoh: jika kos penyedia bagi satu permintaan ialah RM0.023, harga pengguna sebelum pembundaran ialah RM0.23, iaitu 23 kredit.
+```json
+{
+  "app_name": "OPR Android",
+  "email": "guru@example.com",
+  "password": "kata-laluan-minimum-8",
+  "device_id": "android:..."
+}
+```
 
-`ModelPrice` hendaklah menyimpan kadar kos sebenar OpenAI dalam RM bagi setiap 1 juta token input/output. `CONSUMER_PRICE_MULTIPLIER` lalai ialah 10.
+Log masuk tidak menghasilkan bonus baharu. Token sesi baharu dikeluarkan untuk peranti tersebut dan dompet lama terus digunakan.
 
-## Model AI dipilih di server
+### Akaun lama v0.5
+Rekod lama tidak mempunyai kata laluan. Jika pengguna menjalankan `register` menggunakan e-mel lama pada peranti yang pernah dikenal pasti, server menetapkan kata laluan pada akaun lama dan memulangkan dompet lama tanpa 50 kredit tambahan.
 
-Klien pengguna tidak memilih model. Endpoint pengguna memilih model dengan keutamaan:
+Jika peranti asal sudah tiada, pentadbir boleh menggunakan endpoint terlindung `POST /v1/admin/users/set-password` dengan `X-Admin-Key`. Ini ialah pemulihan manual sehingga pengesahan e-mel automatik ditambah pada versi akan datang.
 
-1. `DEFAULT_AI_MODEL` jika aktif dan mempunyai harga;
-2. model aktif yang namanya mengandungi `luna`;
-3. model OpenAI aktif pertama sebagai fallback.
+## Keselamatan kata laluan
+- Hash Argon2id (`argon2-cffi`).
+- Kata laluan mentah tidak disimpan dalam PostgreSQL.
+- ID peranti mentah tidak disimpan; server menyimpan HMAC hash.
+- Selepas 5 kata laluan salah, akaun dikunci sementara 15 minit.
+- Token pengguna v2 tamat selepas 30 hari secara lalai.
 
-Nilai lalai `DEFAULT_AI_MODEL` ialah `gpt-5.6-luna`.
+## Migrasi Railway
+Gantikan kod v0.5 dengan v0.6 dan deploy pada PostgreSQL yang sama. Jangan padam database.
 
-## Aliran persetujuan transaksi
+Startup v0.6 menambah secara selamat:
+- `password_hash`
+- `password_set_at`
+- `failed_login_count`
+- `locked_until`
+- jadual `user_devices`
 
-1. Klien menghantar kandungan kepada `POST /v1/user/ai/estimate` tanpa memilih model.
-2. Server memilih AI lalai dan mengira anggaran maksimum.
-3. Tiada kredit ditolak semasa anggaran.
-4. Server mengembalikan jumlah kredit, harga paparan RM dan `estimate_token`.
-5. Pengguna menekan **Setuju**.
-6. Klien memanggil `POST /v1/user/ai/chat` dengan `estimate_token`.
-7. Server memilih semula model, mengesahkan anggaran dan menyemak baki muktamad.
-8. Jika baki tidak cukup, server memulangkan HTTP 402 dan OpenAI tidak dipanggil.
-9. Jika cukup, kredit direservasi, OpenAI dipanggil dan caj akhir dilaraskan berdasarkan token sebenar.
+Wallet dan ledger lama tidak diubah.
 
-Jika input atau konfigurasi model berubah selepas anggaran, pengguna perlu melihat anggaran baharu.
-
-## Railway Variables
-
+## Variables
 ```text
 DATABASE_URL=${{Postgres.DATABASE_URL}}
-MASTER_ADMIN_KEY=<rahsia-admin>
-OPENAI_API_KEY=<openai-service-key>
-SERVICE_NAME=AI Billing Server
+MASTER_ADMIN_KEY=...
+OPENAI_API_KEY=...
 TRIAL_CREDITS=50
-DEVICE_HASH_SECRET=<rahsia-random-panjang>
-USER_TOKEN_SECRET=<rahsia-random-panjang-berbeza>
-PUBLIC_OPR_APP_NAME=OPR Android
-ESTIMATE_TTL_SECONDS=300
 MIN_TOPUP_RM=10
 CONSUMER_PRICE_MULTIPLIER=10
 DEFAULT_AI_MODEL=gpt-5.6-luna
+DEVICE_HASH_SECRET=...
+USER_TOKEN_SECRET=...
+USER_TOKEN_DAYS=30
+LOGIN_MAX_ATTEMPTS=5
+LOGIN_LOCK_MINUTES=15
 ```
 
-## Deploy
+## Health
+`GET /health`
 
-Ganti kandungan repo server v0.4 dengan v0.5 dan push ke GitHub. PostgreSQL lama tidak perlu dipadam.
-
-Semak `/health`. Jangkaan:
-
+Sasaran:
 ```json
 {
   "ok": true,
   "service": "AI Billing Server",
-  "version": "0.5.0",
-  "openai_configured": true,
-  "default_ai_model": "gpt-5.6-luna",
-  "consumer_price_multiplier": 10
+  "version": "0.6.0",
+  "openai_configured": true
 }
 ```

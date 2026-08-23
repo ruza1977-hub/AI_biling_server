@@ -1,13 +1,13 @@
 # Changelog
 
-## v0.5.0
-- Harga pengguna = kos sebenar RM penyedia × 10.
-- 1 kredit kekal 1 sen.
-- Model untuk endpoint pengguna dipilih di server; klien tidak perlu menghantar model.
-- `DEFAULT_AI_MODEL` ditambah dengan lalai `gpt-5.6-luna`.
-- Server mengutamakan model aktif yang mengandungi `luna` jika model lalai tidak ditemui.
-- Endpoint anggaran mengembalikan `model`, `display_price_rm`, `estimate_credits` dan `estimate_token`.
-- Anggaran tidak menolak kredit.
-- Baki disemak semula hanya apabila pengguna bersetuju meneruskan transaksi.
-- Jika baki tidak mencukupi, HTTP 402 dipulangkan sebelum OpenAI dipanggil.
-- Top up manual minimum RM10 / 1,000 kredit dikekalkan.
+## v0.6.0
+- Akaun pengguna kini menggunakan e-mel + kata laluan.
+- Kata laluan disimpan sebagai hash Argon2id, bukan plaintext.
+- Endpoint baharu `POST /v1/public/login` untuk memulihkan dompet pada pemasangan/peranti lain.
+- Pengguna baharu masih menerima 50 kredit sekali sahaja.
+- Akaun lama v0.5 tanpa kata laluan boleh mengaktifkan kata laluan pada peranti yang telah dikenal pasti tanpa menerima bonus kedua.
+- Jadual `user_devices` menyimpan hash peranti yang pernah log masuk; ID peranti mentah tidak disimpan.
+- Token pengguna v2 mempunyai tempoh sah dan terikat kepada peranti sesi. Token v1 lama masih diterima untuk migrasi.
+- Perlindungan percubaan kata laluan: maksimum 5 kegagalan sebelum kunci sementara 15 minit.
+- Endpoint admin `POST /v1/admin/users/set-password` untuk pemulihan manual jika akaun lama tidak lagi mempunyai peranti asal.
+- Semua wallet, ledger, penggunaan AI dan kredit versi lama dikekalkan.
