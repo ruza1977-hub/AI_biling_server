@@ -19,6 +19,16 @@ class Settings(BaseSettings):
     user_token_days: int = 30
     login_max_attempts: int = 5
     login_lock_minutes: int = 15
+    password_reset_expiry_minutes: int = 30
+    password_reset_cooldown_minutes: int = 3
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_username: str = ""
+    smtp_password: str = ""
+    smtp_from_email: str = ""
+    smtp_from_name: str = "OPR Android"
+    smtp_starttls: bool = True
+    smtp_use_ssl: bool = False
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

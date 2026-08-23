@@ -10,6 +10,8 @@ import hashlib
 import hmac
 import re
 import uuid
+import secrets
+import string
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from sqlalchemy import func, select, text
@@ -21,8 +23,9 @@ from .config import settings
 from .db import Base, engine, SessionLocal
 from .models import AIRequest, AppClient, LedgerEntry, ModelPrice, UsageRecord, UserDevice, UserRegistration, Wallet
 from .openai_gateway import OpenAIGatewayError, create_response
-from .schemas import AdminSetPasswordIn, AIEstimateIn, AIChatIn, ChargeIn, PricingIn, PublicLoginUserIn, PublicRegisterUserIn, RegisterAppIn, RegisterAppOut, RegisterUserIn, TopUpCreditsIn, TopUpIn
+from .schemas import AdminSetPasswordIn, AIEstimateIn, AIChatIn, ChangePasswordIn, ChargeIn, ForgotPasswordIn, PricingIn, PublicLoginUserIn, PublicRegisterUserIn, RegisterAppIn, RegisterAppOut, RegisterUserIn, TopUpCreditsIn, TopUpIn
 from .security import UserAuth, create_user_token, device_hash, generate_api_key, get_db, hash_api_key, hash_password, password_needs_rehash, require_admin, require_app, require_user, verify_password
+from .email_service import EmailDeliveryError, email_configured, send_temporary_password
 
 MICROS_PER_RM = 1_000_000
 MICROS_PER_CREDIT = 10_000  # 1 kredit = RM0.01 = 1 sen
@@ -38,6 +41,10 @@ async def lifespan(_: FastAPI):
     with engine.begin() as conn:
         conn.execute(text("ALTER TABLE user_registrations ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255)"))
         conn.execute(text("ALTER TABLE user_registrations ADD COLUMN IF NOT EXISTS password_set_at TIMESTAMPTZ"))
+        conn.execute(text("ALTER TABLE user_registrations ADD COLUMN IF NOT EXISTS password_must_change BOOLEAN NOT NULL DEFAULT FALSE"))
+        conn.execute(text("ALTER TABLE user_registrations ADD COLUMN IF NOT EXISTS password_reset_hash VARCHAR(255)"))
+        conn.execute(text("ALTER TABLE user_registrations ADD COLUMN IF NOT EXISTS password_reset_sent_at TIMESTAMPTZ"))
+        conn.execute(text("ALTER TABLE user_registrations ADD COLUMN IF NOT EXISTS password_reset_expires_at TIMESTAMPTZ"))
         conn.execute(text("ALTER TABLE user_registrations ADD COLUMN IF NOT EXISTS failed_login_count INTEGER NOT NULL DEFAULT 0"))
         conn.execute(text("ALTER TABLE user_registrations ADD COLUMN IF NOT EXISTS locked_until TIMESTAMPTZ"))
     # user_devices depends only on existing columns, so create again after the migration.
@@ -65,7 +72,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title=settings.service_name, version="0.6.0", lifespan=lifespan)
+app = FastAPI(title=settings.service_name, version="0.7.0", lifespan=lifespan)
 
 
 def micros_to_rm(value: int) -> str:
@@ -144,6 +151,7 @@ def registration_response(reg: UserRegistration, db: Session, *, duplicate: bool
         "balance_credits": micros_to_credits(balance),
         "balance_rm": micros_to_rm(balance),
         "password_configured": bool(reg.password_hash),
+        "password_must_change": bool(reg.password_must_change),
     }
 
 
@@ -236,8 +244,9 @@ def health():
     return {
         "ok": True,
         "service": settings.service_name,
-        "version": "0.6.0",
+        "version": "0.7.0",
         "openai_configured": bool(settings.openai_api_key),
+        "email_configured": email_configured(),
         "default_ai_model": settings.default_ai_model,
         "consumer_price_multiplier": settings.consumer_price_multiplier,
     }
@@ -379,6 +388,10 @@ def admin_set_user_password(payload: AdminSetPasswordIn, db: Session = Depends(g
         raise HTTPException(status_code=404, detail={"code": "ACCOUNT_NOT_FOUND", "message": "Akaun e-mel tidak ditemui."})
     reg.password_hash = hash_password(payload.new_password)
     reg.password_set_at = datetime.now(timezone.utc)
+    reg.password_must_change = False
+    reg.password_reset_hash = None
+    reg.password_reset_sent_at = None
+    reg.password_reset_expires_at = None
     reg.failed_login_count = 0
     reg.locked_until = None
     db.commit()
@@ -404,6 +417,7 @@ def admin_users(
         "device_id_hash_prefix": reg.device_id_hash[:12],
         "trial_credits": reg.trial_credits, "trial_granted": reg.trial_granted,
         "password_configured": bool(reg.password_hash),
+        "password_must_change": bool(reg.password_must_change),
         "balance_credits": micros_to_credits(balance),
         "balance_rm": micros_to_rm(balance),
         "created_at": reg.created_at, "last_seen_at": reg.last_seen_at,
@@ -669,6 +683,10 @@ def public_register_user(payload: PublicRegisterUserIn, db: Session = Depends(ge
             })
         existing.password_hash = hash_password(payload.password)
         existing.password_set_at = datetime.now(timezone.utc)
+        existing.password_must_change = False
+        existing.password_reset_hash = None
+        existing.password_reset_sent_at = None
+        existing.password_reset_expires_at = None
         existing.last_seen_at = datetime.now(timezone.utc)
         existing.failed_login_count = 0
         existing.locked_until = None
@@ -694,6 +712,7 @@ def public_register_user(payload: PublicRegisterUserIn, db: Session = Depends(ge
         trial_credits=settings.trial_credits,
         password_hash=hash_password(payload.password),
         password_set_at=datetime.now(timezone.utc),
+        password_must_change=False,
         failed_login_count=0,
         last_seen_at=datetime.now(timezone.utc),
     )
@@ -750,17 +769,31 @@ def public_login_user(payload: PublicLoginUserIn, db: Session = Depends(get_db))
             "message": f"Terlalu banyak percubaan kata laluan. Cuba lagi dalam kira-kira {max(1, seconds // 60)} minit.",
         })
 
-    if not verify_password(reg.password_hash, payload.password):
+    normal_password_ok = verify_password(reg.password_hash, payload.password)
+    temporary_password_ok = False
+    if reg.password_reset_hash and reg.password_reset_expires_at and reg.password_reset_expires_at >= now:
+        temporary_password_ok = verify_password(reg.password_reset_hash, payload.password)
+
+    if not normal_password_ok and not temporary_password_ok:
         reg.failed_login_count = int(reg.failed_login_count or 0) + 1
         if reg.failed_login_count >= settings.login_max_attempts:
             reg.locked_until = now + timedelta(minutes=settings.login_lock_minutes)
             reg.failed_login_count = 0
         db.commit()
-        raise HTTPException(status_code=401, detail={"code": "INVALID_CREDENTIALS", "message": "E-mel atau kata laluan tidak betul."})
+        raise HTTPException(status_code=401, detail={"code": "INVALID_CREDENTIALS", "message": "E-mel atau kata laluan tidak betul. Jika kata laluan sementara telah tamat tempoh, minta yang baharu."})
 
-    if password_needs_rehash(reg.password_hash):
-        reg.password_hash = hash_password(payload.password)
-        reg.password_set_at = now
+    if temporary_password_ok:
+        reg.password_must_change = True
+    else:
+        # Kata laluan asal masih sah walaupun seseorang meminta reset. Login asal membatalkan
+        # kata laluan sementara supaya endpoint lupa kata laluan tidak boleh digunakan untuk DoS.
+        if password_needs_rehash(reg.password_hash):
+            reg.password_hash = hash_password(payload.password)
+            reg.password_set_at = now
+        reg.password_must_change = False
+        reg.password_reset_hash = None
+        reg.password_reset_sent_at = None
+        reg.password_reset_expires_at = None
     reg.failed_login_count = 0
     reg.locked_until = None
     reg.last_seen_at = now
@@ -771,7 +804,76 @@ def public_login_user(payload: PublicLoginUserIn, db: Session = Depends(get_db))
     result = registration_response(reg, db, duplicate=True, trial_granted_now=False)
     result["access_token"] = create_user_token(reg, current_device_hash=device_hash_value)
     result["login"] = True
+    result["password_must_change"] = bool(reg.password_must_change)
     return result
+
+
+def _temporary_password(length: int = 12) -> str:
+    alphabet = string.ascii_letters + string.digits + "!@#$%"
+    while True:
+        value = "".join(secrets.choice(alphabet) for _ in range(length))
+        if (any(c.islower() for c in value) and any(c.isupper() for c in value)
+                and any(c.isdigit() for c in value) and any(c in "!@#$%" for c in value)):
+            return value
+
+
+@app.post("/v1/public/forgot-password")
+def public_forgot_password(payload: ForgotPasswordIn, db: Session = Depends(get_db)):
+    client = db.scalar(select(AppClient).where(AppClient.name == payload.app_name, AppClient.active.is_(True)))
+    if not client:
+        # Keep the public response generic.
+        return {"ok": True, "message": "Jika e-mel berdaftar, kata laluan sementara akan dihantar."}
+
+    email = normalize_email(payload.email)
+    reg = db.scalar(select(UserRegistration).where(
+        UserRegistration.app_id == client.id,
+        UserRegistration.email_normalized == email,
+        UserRegistration.active.is_(True),
+    ))
+    generic = {"ok": True, "message": "Jika e-mel berdaftar, kata laluan sementara akan dihantar."}
+    if not reg:
+        return generic
+    if not email_configured():
+        raise HTTPException(status_code=503, detail={
+            "code": "EMAIL_NOT_CONFIGURED",
+            "message": "Perkhidmatan e-mel belum dikonfigurasi pada server.",
+        })
+
+    now = datetime.now(timezone.utc)
+    if reg.password_reset_sent_at:
+        age = (now - reg.password_reset_sent_at).total_seconds()
+        if age < settings.password_reset_cooldown_minutes * 60:
+            return generic
+
+    temporary = _temporary_password()
+    try:
+        send_temporary_password(email, temporary, settings.password_reset_expiry_minutes)
+    except EmailDeliveryError as exc:
+        raise HTTPException(status_code=503, detail={"code": "EMAIL_SEND_FAILED", "message": str(exc)})
+
+    reg.password_reset_hash = hash_password(temporary)
+    reg.password_must_change = False
+    reg.password_reset_sent_at = now
+    reg.password_reset_expires_at = now + timedelta(minutes=settings.password_reset_expiry_minutes)
+    reg.failed_login_count = 0
+    reg.locked_until = None
+    db.commit()
+    return generic
+
+
+@app.post("/v1/user/password/change")
+def user_change_password(payload: ChangePasswordIn, auth: UserAuth = Depends(require_user), db: Session = Depends(get_db)):
+    reg = auth.registration
+    reg.password_hash = hash_password(payload.new_password)
+    reg.password_set_at = datetime.now(timezone.utc)
+    reg.password_must_change = False
+    reg.password_reset_hash = None
+    reg.password_reset_sent_at = None
+    reg.password_reset_expires_at = None
+    reg.failed_login_count = 0
+    reg.locked_until = None
+    db.commit()
+    return {"ok": True, "message": "Kata laluan baharu berjaya disimpan."}
 
 
 @app.get("/v1/user/models")

@@ -77,6 +77,15 @@ class PublicLoginUserIn(BaseModel):
     device_id: str = Field(min_length=6, max_length=300)
 
 
+class ForgotPasswordIn(BaseModel):
+    app_name: str = Field(min_length=2, max_length=120)
+    email: str = Field(min_length=5, max_length=254)
+
+
+class ChangePasswordIn(BaseModel):
+    new_password: str = Field(min_length=8, max_length=128)
+
+
 class AdminSetPasswordIn(BaseModel):
     app_name: str = Field(min_length=2, max_length=120)
     email: str = Field(min_length=5, max_length=254)
