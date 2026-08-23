@@ -42,7 +42,7 @@ class ChargeIn(BaseModel):
 
 class AIChatIn(BaseModel):
     external_user_id: str = Field(min_length=1, max_length=160)
-    model: str = Field(min_length=1, max_length=120)
+    model: str | None = Field(default=None, max_length=120)
     input: str = Field(min_length=1, max_length=200_000)
     instructions: str | None = Field(default=None, max_length=50_000)
     max_output_tokens: int = Field(default=2048, ge=16, le=32768)
@@ -53,7 +53,7 @@ class AIChatIn(BaseModel):
 
 class AIEstimateIn(BaseModel):
     external_user_id: str = Field(min_length=1, max_length=160)
-    model: str = Field(min_length=1, max_length=120)
+    model: str | None = Field(default=None, max_length=120)
     input: str = Field(min_length=1, max_length=200_000)
     instructions: str | None = Field(default=None, max_length=50_000)
     max_output_tokens: int = Field(default=2048, ge=16, le=32768)

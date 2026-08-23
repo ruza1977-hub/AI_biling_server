@@ -43,11 +43,15 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title=settings.service_name, version="0.4.0", lifespan=lifespan)
+app = FastAPI(title=settings.service_name, version="0.5.0", lifespan=lifespan)
 
 
 def micros_to_rm(value: int) -> str:
     return str((Decimal(value) / Decimal(MICROS_PER_RM)).quantize(Decimal("0.000001")))
+
+
+def credits_to_rm_display(credits: int) -> str:
+    return str((Decimal(credits) / Decimal(CREDITS_PER_RM)).quantize(Decimal("0.00")))
 
 
 def rm_to_micros(value: Decimal) -> int:
@@ -64,15 +68,20 @@ def micros_to_credits(value: int) -> int:
 
 
 def charge_for_tokens(input_tokens: int, output_tokens: int, *, input_rate: int, output_rate: int, markup_bps: int) -> int:
-    raw_cost = (
+    # ModelPrice menyimpan kos sebenar penyedia dalam RM per 1 juta token.
+    # Harga pengguna = kos sebenar RM x CONSUMER_PRICE_MULTIPLIER (lalai 10).
+    # markup_bps dikekalkan dalam skema untuk keserasian admin lama tetapi tidak digunakan
+    # dalam aliran harga pengguna v0.5.
+    del markup_bps
+    provider_cost_micros = (
         Decimal(input_tokens) * Decimal(input_rate)
         + Decimal(output_tokens) * Decimal(output_rate)
     ) / Decimal(TOKENS_PER_MILLION)
-    with_markup = raw_cost * (Decimal(10_000 + markup_bps) / Decimal(10_000))
     if input_tokens == 0 and output_tokens == 0:
         return 0
-    raw_micros = max(1, int(with_markup.to_integral_value(rounding=ROUND_CEILING)))
-    # Pengguna membayar dalam unit kredit bulat: 1 kredit = 1 sen.
+    user_price_micros = provider_cost_micros * Decimal(settings.consumer_price_multiplier)
+    raw_micros = max(1, int(user_price_micros.to_integral_value(rounding=ROUND_CEILING)))
+    # Pengguna membayar kredit bulat. 1 kredit = 1 sen = RM0.01.
     credits = int((Decimal(raw_micros) / Decimal(MICROS_PER_CREDIT)).to_integral_value(rounding=ROUND_CEILING))
     return max(1, credits) * MICROS_PER_CREDIT
 
@@ -141,6 +150,36 @@ def get_active_price(db: Session, provider: str, model: str) -> ModelPrice:
     return price
 
 
+def get_default_ai_price(db: Session) -> ModelPrice:
+    # Server memilih model; aplikasi pengguna tidak diberi pilihan model.
+    # Keutamaan: model yang ditetapkan dalam DEFAULT_AI_MODEL, kemudian model aktif
+    # yang mengandungi perkataan "luna", kemudian model OpenAI aktif pertama sebagai fallback.
+    price = db.scalar(select(ModelPrice).where(
+        ModelPrice.provider == "openai",
+        ModelPrice.model == settings.default_ai_model,
+        ModelPrice.active.is_(True),
+    ))
+    if price:
+        return price
+    price = db.scalar(select(ModelPrice).where(
+        ModelPrice.provider == "openai",
+        ModelPrice.active.is_(True),
+        func.lower(ModelPrice.model).contains("luna"),
+    ).order_by(ModelPrice.model).limit(1))
+    if price:
+        return price
+    price = db.scalar(select(ModelPrice).where(
+        ModelPrice.provider == "openai",
+        ModelPrice.active.is_(True),
+    ).order_by(ModelPrice.model).limit(1))
+    if not price:
+        raise HTTPException(status_code=400, detail={
+            "code": "NO_ACTIVE_AI_MODEL",
+            "message": "Tiada model OpenAI aktif/harga dikonfigurasi pada server.",
+        })
+    return price
+
+
 def replay_ai_request(req: AIRequest, db: Session) -> dict:
     wallet = db.get(Wallet, req.wallet_id)
     balance = wallet.balance_micros if wallet else 0
@@ -174,8 +213,10 @@ def health():
     return {
         "ok": True,
         "service": settings.service_name,
-        "version": "0.4.0",
+        "version": "0.5.0",
         "openai_configured": bool(settings.openai_api_key),
+        "default_ai_model": settings.default_ai_model,
+        "consumer_price_multiplier": settings.consumer_price_multiplier,
     }
 
 
@@ -633,7 +674,10 @@ def user_ai_estimate(payload: AIEstimateIn, auth: UserAuth = Depends(require_use
     reg = auth.registration
     if payload.external_user_id != reg.external_user_id:
         raise HTTPException(status_code=403, detail={"code": "USER_MISMATCH", "message": "ID pengguna tidak sepadan."})
-    price = get_active_price(db, "openai", payload.model)
+
+    # Model dipilih di server. Klien tidak menentukan model.
+    price = get_default_ai_price(db)
+    payload.model = price.model
     estimated_input = reservation_input_tokens(payload.input, payload.instructions)
     reserve_micros = charge_for_tokens(
         estimated_input, payload.max_output_tokens,
@@ -651,13 +695,15 @@ def user_ai_estimate(payload: AIEstimateIn, auth: UserAuth = Depends(require_use
     )
     return {
         "ok": True,
+        "model": price.model,
         "estimate_credits": estimate_credits,
+        "display_price_rm": credits_to_rm_display(estimate_credits),
+        "price_multiplier": settings.consumer_price_multiplier,
         "balance_credits": balance_credits,
         "balance_after_estimate_credits": max(0, balance_credits - estimate_credits),
-        "enough_credit": balance_micros >= reserve_micros,
         "estimate_token": token,
         "expires_in_seconds": settings.estimate_ttl_seconds,
-        "note": "Ini anggaran maksimum konservatif. Caj akhir menggunakan token sebenar dan tidak melebihi anggaran yang diluluskan tanpa anggaran baharu.",
+        "note": "Anggaran belum menolak kredit. Harga pengguna ialah kos sebenar RM penyedia didarab 10 dan dibundarkan kepada kredit penuh. Selepas pengguna bersetuju, baki disemak semula sebelum AI dipanggil.",
     }
 
 
@@ -668,11 +714,15 @@ def user_ai_chat(payload: AIChatIn, auth: UserAuth = Depends(require_user), db: 
         raise HTTPException(status_code=403, detail={"code": "USER_MISMATCH", "message": "ID pengguna tidak sepadan."})
     if not payload.estimate_token:
         raise HTTPException(status_code=409, detail={"code": "ESTIMATE_REQUIRED", "message": "Anggaran kredit mesti dipaparkan dan diluluskan sebelum transaksi AI."})
+
+    # Pilih model sekali lagi di server. Jika konfigurasi berubah selepas anggaran, fingerprint
+    # akan berbeza dan pengguna mesti melihat anggaran baharu.
+    price = get_default_ai_price(db)
+    payload.model = price.model
     quote = _read_estimate_token(payload.estimate_token)
     if quote.get("app_id") != str(reg.app_id) or quote.get("user_id") != reg.external_user_id or quote.get("fp") != _estimate_fingerprint(payload):
-        raise HTTPException(status_code=409, detail={"code": "ESTIMATE_MISMATCH", "message": "Maklumat berubah selepas anggaran. Sila anggar semula."})
+        raise HTTPException(status_code=409, detail={"code": "ESTIMATE_MISMATCH", "message": "Maklumat atau model berubah selepas anggaran. Sila anggar semula."})
 
-    price = get_active_price(db, "openai", payload.model)
     current_reserve = charge_for_tokens(
         reservation_input_tokens(payload.input, payload.instructions), payload.max_output_tokens,
         input_rate=price.input_micros_per_million,
@@ -682,6 +732,8 @@ def user_ai_chat(payload: AIChatIn, auth: UserAuth = Depends(require_user), db: 
     current_credits = micros_to_credits(current_reserve)
     if current_credits > int(quote.get("credits", 0)):
         raise HTTPException(status_code=409, detail={"code": "ESTIMATE_CHANGED", "message": "Anggaran harga telah berubah. Sila semak anggaran baharu sebelum meneruskan."})
+
+    # Semakan baki muktamad berlaku dalam ai_chat sebelum sebarang panggilan OpenAI.
     return ai_chat(payload, client=auth.client, db=db)
 
 
@@ -821,6 +873,8 @@ def ai_chat(payload: AIChatIn, client: AppClient = Depends(require_app), db: Ses
     if existing:
         return replay_ai_request(existing, db)
 
+    if not payload.model:
+        payload.model = get_default_ai_price(db).model
     price = get_active_price(db, "openai", payload.model)
     estimated_input = reservation_input_tokens(payload.input, payload.instructions)
     reserve_micros = charge_for_tokens(
