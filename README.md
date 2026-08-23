@@ -1,45 +1,50 @@
-# AI Billing Server v0.4
+# AI Billing Server v0.5
 
-Billing + AI Gateway untuk aplikasi seperti OPR Android.
+Billing + AI Gateway untuk OPR Android dan aplikasi lain.
 
 ## Standard kredit
 
 - 1 kredit = RM0.01 = 1 sen
 - Pendaftaran baharu menerima 50 kredit sekali sahaja
 - Top up minimum = RM10 = 1,000 kredit
-- Top up v0.4 masih manual
-- Integrasi ToyyibPay disediakan sebagai fasa akan datang
+- Top up sekarang manual
+- ToyyibPay dirancang untuk fasa akan datang
 
-## Baharu v0.4
+## Harga pengguna v0.5
 
-### Pendaftaran aplikasi awam yang selamat untuk klien Android
-`POST /v1/public/register`
+Harga yang dikenakan kepada pengguna dikira di server:
 
-OPR Android hanya menghantar:
-- nama aplikasi (`OPR Android`)
-- e-mel
-- ID peranti
+`kos sebenar penyedia dalam RM × 10 = harga pengguna`
 
-Server menyimpan e-mel dan HMAC hash ID peranti. ID mentah tidak disimpan. Jika e-mel/peranti yang sama mendaftar semula, akaun lama dipulihkan tanpa bonus kedua. Jika e-mel atau peranti cuba dipadankan dengan pendaftaran lain, server menolak pendaftaran.
+Harga pengguna kemudian dibundarkan ke kredit penuh kerana 1 kredit = 1 sen.
 
-Server mengeluarkan token pengguna bertandatangan. Android menyimpan token itu menggunakan Android Keystore. `X-API-Key` aplikasi tidak perlu ditanam dalam APK.
+Contoh: jika kos penyedia bagi satu permintaan ialah RM0.023, harga pengguna sebelum pembundaran ialah RM0.23, iaitu 23 kredit.
 
-### Akaun kredit pengguna
-- `GET /v1/user/account/summary`
-- `GET /v1/user/usage/recent`
-- `GET /v1/user/topup/info`
-- `GET /v1/user/models`
+`ModelPrice` hendaklah menyimpan kadar kos sebenar OpenAI dalam RM bagi setiap 1 juta token input/output. `CONSUMER_PRICE_MULTIPLIER` lalai ialah 10.
 
-### Wajib anggar sebelum caj AI
-1. Android memanggil `POST /v1/user/ai/estimate`.
-2. Server mengira anggaran maksimum konservatif tanpa menolak kredit.
-3. Server mengeluarkan `estimate_token` sah untuk tempoh pendek (default 5 minit).
-4. Android memaparkan anggaran, baki semasa dan baki selepas anggaran.
-5. Hanya selepas pengguna menekan Setuju, Android memanggil `POST /v1/user/ai/chat` bersama `estimate_token`.
-6. Jika input/model berubah atau anggaran tamat tempoh, transaksi ditolak dan pengguna perlu melihat anggaran baharu.
-7. Caj akhir menggunakan token sebenar dan lazimnya sama atau lebih rendah daripada anggaran maksimum.
+## Model AI dipilih di server
 
-Endpoint `/v1/ai/chat` v0.2/v0.3 kekal untuk klien lama yang menggunakan `X-API-Key`.
+Klien pengguna tidak memilih model. Endpoint pengguna memilih model dengan keutamaan:
+
+1. `DEFAULT_AI_MODEL` jika aktif dan mempunyai harga;
+2. model aktif yang namanya mengandungi `luna`;
+3. model OpenAI aktif pertama sebagai fallback.
+
+Nilai lalai `DEFAULT_AI_MODEL` ialah `gpt-5.6-luna`.
+
+## Aliran persetujuan transaksi
+
+1. Klien menghantar kandungan kepada `POST /v1/user/ai/estimate` tanpa memilih model.
+2. Server memilih AI lalai dan mengira anggaran maksimum.
+3. Tiada kredit ditolak semasa anggaran.
+4. Server mengembalikan jumlah kredit, harga paparan RM dan `estimate_token`.
+5. Pengguna menekan **Setuju**.
+6. Klien memanggil `POST /v1/user/ai/chat` dengan `estimate_token`.
+7. Server memilih semula model, mengesahkan anggaran dan menyemak baki muktamad.
+8. Jika baki tidak cukup, server memulangkan HTTP 402 dan OpenAI tidak dipanggil.
+9. Jika cukup, kredit direservasi, OpenAI dipanggil dan caj akhir dilaraskan berdasarkan token sebenar.
+
+Jika input atau konfigurasi model berubah selepas anggaran, pengguna perlu melihat anggaran baharu.
 
 ## Railway Variables
 
@@ -54,29 +59,23 @@ USER_TOKEN_SECRET=<rahsia-random-panjang-berbeza>
 PUBLIC_OPR_APP_NAME=OPR Android
 ESTIMATE_TTL_SECONDS=300
 MIN_TOPUP_RM=10
+CONSUMER_PRICE_MULTIPLIER=10
+DEFAULT_AI_MODEL=gpt-5.6-luna
 ```
-
-`DEVICE_HASH_SECRET` dan `USER_TOKEN_SECRET` sangat digalakkan. Jika kosong, server menggunakan `MASTER_ADMIN_KEY` sebagai fallback.
 
 ## Deploy
 
-Ganti kandungan repo server lama dengan v0.4 dan push ke GitHub. Railway akan deploy semula. PostgreSQL lama tidak perlu dipadam.
+Ganti kandungan repo server v0.4 dengan v0.5 dan push ke GitHub. PostgreSQL lama tidak perlu dipadam.
 
-Semak:
-
-```text
-GET /health
-```
-
-Jangkaan:
+Semak `/health`. Jangkaan:
 
 ```json
 {
   "ok": true,
   "service": "AI Billing Server",
-  "version": "0.4.0",
-  "openai_configured": true
+  "version": "0.5.0",
+  "openai_configured": true,
+  "default_ai_model": "gpt-5.6-luna",
+  "consumer_price_multiplier": 10
 }
 ```
-
-Pada startup, server memastikan aplikasi bernama `OPR Android` wujud. Jika belum ada, rekod AppClient dicipta secara automatik.

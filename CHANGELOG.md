@@ -1,14 +1,13 @@
 # Changelog
 
-## v0.4.0
+## v0.5.0
+- Harga pengguna = kos sebenar RM penyedia × 10.
 - 1 kredit kekal 1 sen.
-- Bonus pendaftaran kekal 50 kredit.
-- Tambah pendaftaran awam OPR Android tanpa mendedahkan `X-API-Key` dalam APK.
-- Tambah token pengguna bertandatangan dan pengesahan ID peranti pada permintaan pengguna.
-- Tambah ringkasan baki, jumlah penggunaan dan sejarah penggunaan per pengguna.
-- Tambah endpoint anggaran kredit tanpa caj.
-- Wajibkan `estimate_token` sebelum transaksi AI melalui laluan pengguna.
-- Anggaran mempunyai tempoh tamat dan terikat kepada user/model/input/instructions/max output.
-- Top up minimum ditetapkan RM10 / 1,000 kredit.
-- Top up masih manual; metadata menyatakan ToyyibPay sebagai penyedia akan datang.
-- Kekalkan endpoint lama untuk keserasian Admin dan klien v0.2/v0.3.
+- Model untuk endpoint pengguna dipilih di server; klien tidak perlu menghantar model.
+- `DEFAULT_AI_MODEL` ditambah dengan lalai `gpt-5.6-luna`.
+- Server mengutamakan model aktif yang mengandungi `luna` jika model lalai tidak ditemui.
+- Endpoint anggaran mengembalikan `model`, `display_price_rm`, `estimate_credits` dan `estimate_token`.
+- Anggaran tidak menolak kredit.
+- Baki disemak semula hanya apabila pengguna bersetuju meneruskan transaksi.
+- Jika baki tidak mencukupi, HTTP 402 dipulangkan sebelum OpenAI dipanggil.
+- Top up manual minimum RM10 / 1,000 kredit dikekalkan.
